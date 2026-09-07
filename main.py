@@ -83,6 +83,12 @@ def is_admin():
     return get_current_email() in ADMIN_EMAILS
 
 
+def get_current_user_id():
+    """Return the authenticated Supabase user's UUID safely."""
+    user = st.session_state.get("user")
+    return getattr(user, "id", None)
+
+
 def format_datetime(value):
     if not value:
         return "Not available"
@@ -592,7 +598,7 @@ def find_matching_master_product(extracted, mappings, master_products):
             return mapping.get("master_product_name"), "Saved SKU mapping"
 
     for product in master_products:
-        name = product.get("name") or product.get("master_product_name") or ""
+        name = product.get("product_name") or product.get("master_product_name") or ""
         name_norm = normalize_text(name)
         if name_norm and (name_norm in sku_norm or sku_norm in name_norm):
             return name, "Automatic name match"
@@ -600,7 +606,7 @@ def find_matching_master_product(extracted, mappings, master_products):
     best_name = None
     best_score = 0.0
     for product in master_products:
-        name = product.get("name") or product.get("master_product_name") or ""
+        name = product.get("product_name") or product.get("master_product_name") or ""
         score = product_similarity(sku, name)
         if score > best_score:
             best_score = score
@@ -789,7 +795,7 @@ def get_inventory():
             .table("master_products")
             .select("*")
             .eq("company_id", company_id)
-            .order("name")
+            .order("product_name")
             .execute()
         )
 
@@ -807,7 +813,7 @@ def update_inventory(product_id, new_quantity):
     try:
 
         supabase.table("master_products").update({
-            "quantity": int(new_quantity)
+            "inventory_quantity": int(new_quantity)
         }).eq("id", product_id).execute()
 
         return True
@@ -822,7 +828,7 @@ def update_inventory(product_id, new_quantity):
 def deduct_inventory_from_pickup(pickup_dataframe):
     inventory = get_inventory()
     inventory_lookup = {
-        normalize_text(item.get("name") or item.get("master_product_name")): item
+        normalize_text(item.get("product_name") or item.get("master_product_name")): item
         for item in inventory
     }
 
@@ -838,7 +844,7 @@ def deduct_inventory_from_pickup(pickup_dataframe):
             failed.append(f"{product_name}: Not found in inventory")
             continue
 
-        current_quantity = int(inventory_item.get("quantity", 0) or 0)
+        current_quantity = int(inventory_item.get("inventory_quantity", 0) or 0)
         new_quantity = max(0, current_quantity - quantity_needed)
 
         if update_inventory(inventory_item["id"], new_quantity):
@@ -872,7 +878,7 @@ def get_low_stock_products():
     for product in inventory:
 
         quantity = int(
-            product.get("quantity", 0) or 0
+            product.get("inventory_quantity", 0) or 0
         )
 
         minimum_stock = int(
@@ -1165,7 +1171,7 @@ def show_dashboard():
     with col2:
 
         total_inventory = sum(
-            int(item.get("quantity", 0) or 0)
+            int(item.get("inventory_quantity", 0) or 0)
             for item in inventory
         )
 
@@ -1190,7 +1196,7 @@ def show_dashboard():
         for product in low_stock:
 
             name = (
-                product.get("name")
+                product.get("product_name")
                 or product.get("master_product_name")
                 or "Unnamed Product"
             )
@@ -1269,8 +1275,8 @@ def show_master_products():
                     ).insert({
                         "company_id": company_id,
                         "user_id": get_current_user_id(),
-                        "name": product_name.strip(),
-                        "quantity": int(initial_quantity),
+                        "product_name": product_name.strip(),
+                        "inventory_quantity": int(initial_quantity),
                         "minimum_stock": int(minimum_stock)
                     }).execute()
 
@@ -1297,10 +1303,10 @@ def show_master_products():
             display_data.append({
                 "ID": item.get("id"),
                 "Master Product":
-                    item.get("name")
+                    item.get("product_name")
                     or item.get("master_product_name"),
                 "Quantity":
-                    item.get("quantity", 0),
+                    item.get("inventory_quantity", 0),
                 "Minimum Stock":
                     item.get("minimum_stock", 0)
             })
@@ -1341,7 +1347,7 @@ def show_sku_mappings():
     for product in inventory:
 
         name = (
-            product.get("name")
+            product.get("product_name")
             or product.get("master_product_name")
         )
 
@@ -1586,7 +1592,7 @@ def show_inventory():
     for product in inventory:
 
         name = (
-            product.get("name")
+            product.get("product_name")
             or product.get("master_product_name")
             or "Unnamed Product"
         )
@@ -1594,7 +1600,7 @@ def show_inventory():
         product_id = product["id"]
 
         current_quantity = int(
-            product.get("quantity", 0) or 0
+            product.get("inventory_quantity", 0) or 0
         )
 
         minimum_stock = int(
@@ -1638,7 +1644,7 @@ def show_inventory():
                     supabase.table(
                         "master_products"
                     ).update({
-                        "quantity": int(new_quantity),
+                        "inventory_quantity": int(new_quantity),
                         "minimum_stock": int(new_minimum)
                     }).eq(
                         "id",
