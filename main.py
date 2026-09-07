@@ -44,8 +44,10 @@ def get_supabase():
         st.stop()
 
 
-@st.cache_resource
 def get_cookie_manager():
+    # Do not cache Streamlit custom components.
+    # CookieManager creates a Streamlit widget and caching it causes
+    # CachedWidgetWarning and can interfere with component rendering.
     return stx.CookieManager()
 
 
