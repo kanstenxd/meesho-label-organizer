@@ -1,4 +1,5 @@
 streamlit
 supabase
-pandas
 PyMuPDF
+pandas
+streamlit-cookies-manager
