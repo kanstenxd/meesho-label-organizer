@@ -1317,6 +1317,81 @@ def show_master_products():
             hide_index=True
         )
 
+        # --------------------------------------------------------
+        # DELETE MASTER PRODUCT
+        # --------------------------------------------------------
+        st.divider()
+        st.subheader("🗑️ Delete Master Product")
+
+        delete_options = {
+            (
+                f"{item.get('product_name') or item.get('master_product_name') or 'Unnamed Product'} "
+                f"(ID: {str(item.get('id', ''))[:8]}...)"
+            ): item
+            for item in inventory
+        }
+
+        selected_delete_label = st.selectbox(
+            "Select the Master Product you want to delete",
+            [""] + list(delete_options.keys()),
+            key="delete_master_product_select",
+        )
+
+        if selected_delete_label:
+            selected_product = delete_options[selected_delete_label]
+            selected_product_id = selected_product.get("id")
+            selected_product_name = (
+                selected_product.get("product_name")
+                or selected_product.get("master_product_name")
+                or ""
+            )
+
+            st.warning(
+                f"You are about to permanently delete: **{selected_product_name}**"
+            )
+
+            confirm_delete = st.checkbox(
+                f"I confirm that I want to delete {selected_product_name}",
+                key="confirm_master_product_delete",
+            )
+
+            if st.button(
+                "🗑️ Delete Selected Master Product",
+                disabled=not confirm_delete,
+                key="delete_master_product_button",
+            ):
+                try:
+                    # Remove SKU mappings for this product first.
+                    try:
+                        (
+                            supabase
+                            .table("sku_mappings")
+                            .delete()
+                            .eq("company_id", company_id)
+                            .eq("master_product_name", selected_product_name)
+                            .execute()
+                        )
+                    except Exception:
+                        pass
+
+                    # Delete the Master Product.
+                    (
+                        supabase
+                        .table("master_products")
+                        .delete()
+                        .eq("id", selected_product_id)
+                        .eq("company_id", company_id)
+                        .execute()
+                    )
+
+                    st.success(
+                        f"Master Product '{selected_product_name}' was deleted successfully."
+                    )
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not delete Master Product: {e}")
+
     else:
 
         st.info(
