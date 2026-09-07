@@ -780,6 +780,24 @@ def _get_sku_mapping_sku_column():
     return None
 
 
+def _sku_mappings_has_user_id():
+    """Check whether the installed sku_mappings table has a user_id column.
+
+    Newer database versions use user_id for Row Level Security.  We detect the
+    column instead of assuming every older installation has it.
+    """
+    cached = st.session_state.get("sku_mappings_has_user_id")
+    if cached is not None:
+        return bool(cached)
+    try:
+        supabase.table("sku_mappings").select("id,user_id").limit(1).execute()
+        st.session_state.sku_mappings_has_user_id = True
+        return True
+    except Exception:
+        st.session_state.sku_mappings_has_user_id = False
+        return False
+
+
 def _get_sku_mapping_master_column():
     """Resolve the master-product column without assuming one fixed schema.
 
@@ -871,12 +889,24 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
+    """Load mappings belonging to the current authenticated user/company."""
     company_id = get_company_id()
-    if not company_id:
+    user_id = get_current_user_id()
+    if not company_id and not user_id:
         return []
 
     try:
-        response = supabase.table("sku_mappings").select("*").eq("company_id", company_id).execute()
+        query = supabase.table("sku_mappings").select("*")
+
+        # sku_mappings RLS in the current database is based on user_id.  Use
+        # that column when available; this also prevents company_id from
+        # accidentally hiding a user's own mappings.
+        if _sku_mappings_has_user_id() and user_id:
+            query = query.eq("user_id", user_id)
+        elif company_id:
+            query = query.eq("company_id", company_id)
+
+        response = query.execute()
         sku_column = _get_sku_mapping_sku_column()
         master_column = _get_sku_mapping_master_column()
         return [_normalize_mapping_row(row, sku_column, master_column) for row in (response.data or [])]
@@ -884,16 +914,21 @@ def get_user_mappings():
         st.error(f"Could not load SKU mappings: {e}")
         return []
 
-
 def save_sku_mapping(sku, master_product_name):
+    """Save a user-approved SKU mapping.
+
+    The first-time assignment is always user initiated.  The saved row stores
+    user_id whenever that column exists so Supabase RLS can verify ownership.
+    """
     sku = str(sku or "").strip()
     master_product_name = str(master_product_name or "").strip()
     if not sku or not master_product_name:
         return False
 
     company_id = get_company_id()
-    if not company_id:
-        st.error("Could not save SKU mapping: company information is missing.")
+    user_id = get_current_user_id()
+    if not user_id:
+        st.error("Could not save SKU mapping: your login session could not be verified.")
         return False
 
     sku_column = _get_sku_mapping_sku_column()
@@ -910,10 +945,7 @@ def save_sku_mapping(sku, master_product_name):
         )
         return False
 
-    master_value = _master_product_value_for_storage(
-        master_column,
-        master_product_name,
-    )
+    master_value = _master_product_value_for_storage(master_column, master_product_name)
     if master_value in (None, ""):
         st.error(
             "Could not save SKU mapping because the selected Master Product "
@@ -921,15 +953,15 @@ def save_sku_mapping(sku, master_product_name):
         )
         return False
 
+    has_user_id = _sku_mappings_has_user_id()
+
     try:
-        existing = (
-            supabase.table("sku_mappings")
-            .select("id")
-            .eq("company_id", company_id)
-            .eq(sku_column, sku)
-            .limit(1)
-            .execute()
-        )
+        query = supabase.table("sku_mappings").select("id").eq(sku_column, sku).limit(1)
+        if has_user_id:
+            query = query.eq("user_id", user_id)
+        elif company_id:
+            query = query.eq("company_id", company_id)
+        existing = query.execute()
 
         if existing.data:
             update_data = {master_column: master_value}
@@ -941,10 +973,16 @@ def save_sku_mapping(sku, master_product_name):
             )
         else:
             insert_data = {
-                "company_id": company_id,
                 sku_column: sku,
                 master_column: master_value,
             }
+            if company_id:
+                insert_data["company_id"] = company_id
+            # This is the important RLS fix.  The database policy checks
+            # user_id = auth.uid(), so omitting user_id causes error 42501.
+            if has_user_id:
+                insert_data["user_id"] = user_id
+
             (
                 supabase.table("sku_mappings")
                 .insert(insert_data)
@@ -952,11 +990,9 @@ def save_sku_mapping(sku, master_product_name):
             )
         return True
     except Exception as e:
-        # A Supabase schema cache can be stale immediately after a migration.
-        # Forget detected column names so a later rerun can detect the schema
-        # again instead of repeatedly using a stale name.
         st.session_state.pop("sku_mapping_sku_column", None)
         st.session_state.pop("sku_mapping_master_column", None)
+        st.session_state.pop("sku_mappings_has_user_id", None)
         st.error(f"Could not save SKU mapping: {e}")
         return False
 
