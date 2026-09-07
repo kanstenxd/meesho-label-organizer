@@ -1137,6 +1137,8 @@ def reorganize_pdfs(uploaded_files):
     uncategorized_pages = []
     extracted_rows = []
     auto_mappings = []
+    remembered_assignments = []
+    remembered_assignment_keys = set()
     review_candidates = {}
 
     known_skus = {
@@ -1170,6 +1172,28 @@ def reorganize_pdfs(uploaded_files):
                 )
 
                 sku_key = normalize_text(details["sku"])
+
+                # A SKU that was manually mapped earlier is remembered in the
+                # database. When the exact SKU appears again, it is assigned
+                # immediately without asking the user again. Keep a separate
+                # batch record so the interface can clearly notify the user.
+                if (
+                    master_product
+                    and sku_key
+                    and match_method == "Saved SKU mapping"
+                    and sku_key not in remembered_assignment_keys
+                ):
+                    remembered_assignment_keys.add(sku_key)
+                    remembered_assignments.append(
+                        {
+                            "SKU": details["sku"],
+                            "Master Product": master_product,
+                            "Match Method": (
+                                "Automatically assigned from your previous "
+                                "SKU Mapping"
+                            ),
+                        }
+                    )
 
                 # Do not expose the source PDF name in the extracted data.
                 extracted_rows.append(
@@ -1273,6 +1297,7 @@ def reorganize_pdfs(uploaded_files):
         "uncategorized": uncategorized_pages,
         "extracted_rows": extracted_rows,
         "auto_mappings": auto_mappings,
+        "remembered_assignments": remembered_assignments,
         "review_candidates": review_candidates,
     }
 
@@ -2036,6 +2061,22 @@ def show_pdf_organizer():
                     "Labels extracted and organized successfully!"
                 )
 
+                # Popup notifications for SKU mappings remembered from a
+                # previous manual assignment in SKU Mappings or review mode.
+                for assignment in results.get(
+                    "remembered_assignments",
+                    [],
+                ):
+                    st.toast(
+                        (
+                            f"🔁 {assignment['SKU']} was automatically "
+                            f"assigned to '{assignment['Master Product']}' "
+                            "because you assigned this SKU to that Master "
+                            "Product previously."
+                        ),
+                        icon="🔁",
+                    )
+
             except Exception as e:
                 st.error(f"PDF processing failed: {e}")
                 return
@@ -2236,6 +2277,25 @@ def show_pdf_organizer():
                                 )
                                 st.session_state.batch_results = results
                                 st.rerun()
+
+    remembered_assignments = results.get(
+        "remembered_assignments",
+        [],
+    )
+
+    if remembered_assignments:
+        st.info(
+            f"🔁 {len(remembered_assignments)} SKU(s) were automatically "
+            "assigned using mappings you saved previously. No confirmation "
+            "was needed because those SKU-to-Master-Product assignments are "
+            "remembered for future uploads."
+        )
+
+        st.dataframe(
+            pd.DataFrame(remembered_assignments),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     auto_mappings = results.get(
         "auto_mappings",
