@@ -2972,12 +2972,13 @@ if st.session_state.user is None:
     restored = restore_login_from_cookie()
 
     if restored is None:
-        # CookieManager and Supabase can initialize asynchronously after a
-        # browser refresh. Keep the user on a restoration screen instead of
-        # incorrectly sending them back to Login.
+        # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
+        # frontend component needs this run to remain alive long enough to read
+        # the browser cookies and send its value back to Streamlit. Repeated
+        # forced reruns can restart the component before it finishes, causing
+        # the endless "Restoring your login session" -> logout cycle.
         st.info("Restoring your login session…")
-        time.sleep(0.4)
-        st.rerun()
+        st.stop()
 
 if st.session_state.user is None:
     show_auth_page()
