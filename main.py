@@ -1,54 +1,46 @@
 import streamlit as st
-from supabase import create_client, Client
-import fitz  # PyMuPDF
 import pandas as pd
+from supabase import create_client, Client
+from datetime import datetime
+from io import BytesIO
 import re
-from datetime import datetime, timedelta, timezone
+import uuid
 
-
-# ============================================================
+# =========================================================
 # PAGE CONFIGURATION
-# ============================================================
+# =========================================================
 
 st.set_page_config(
     page_title="Meesho Label Organizer",
     page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 
-# ============================================================
-# SUPABASE CONNECTION
-# ============================================================
+# =========================================================
+# SUPABASE CONFIGURATION
+# =========================================================
+
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+
 
 @st.cache_resource
 def get_supabase():
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
-    except Exception as e:
-        st.error("Supabase configuration is missing.")
-        st.stop()
+    """Create and return the Supabase client."""
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-supabase: Client = get_supabase()
+supabase = get_supabase()
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-MONTHLY_PRICE = 399
-LIFETIME_PRICE = 9999
-DEMO_HOURS = 12
-DEMO_PDF_LIMIT = 2
-
-
-# ============================================================
+# =========================================================
 # SESSION STATE
-# ============================================================
+# =========================================================
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -56,498 +48,126 @@ if "user" not in st.session_state:
 if "profile" not in st.session_state:
     st.session_state.profile = None
 
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "Dashboard"
-
-if "batch_results" not in st.session_state:
-    st.session_state.batch_results = None
+if "page" not in st.session_state:
+    st.session_state.page = "Dashboard"
 
 
-# ============================================================
-# AUTH SESSION RESTORATION
-# ============================================================
-
-def restore_authenticated_session():
-    """Restore a valid Supabase login after a Streamlit rerun/page refresh."""
-    if st.session_state.user is not None:
-        return
-
-    try:
-        session_response = supabase.auth.get_session()
-        # Different supabase-py versions return either the Session itself
-        # or an object containing a .session attribute.
-        session = getattr(session_response, "session", session_response)
-
-        if session is not None and getattr(session, "user", None) is not None:
-            st.session_state.user = session.user
-    except Exception:
-        # No valid saved session. The app will show the login/register page.
-        st.session_state.user = None
-
-
-restore_authenticated_session()
-
-
-# ============================================================
+# =========================================================
 # HELPER FUNCTIONS
-# ============================================================
+# =========================================================
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def format_datetime(value):
-    if not value:
-        return "Not available"
-
-    try:
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-        return value.strftime("%d %b %Y, %I:%M %p")
-    except Exception:
-        return str(value)
+def show_error(message):
+    st.error(message)
 
 
-def safe_get_profile(user_id):
-    try:
-        response = (
-            supabase
-            .table("profiles")
-            .select("*")
-            .eq("id", user_id)
-            .execute()
-        )
+def show_success(message):
+    st.success(message)
 
-        if response.data:
-            return response.data[0]
 
-    except Exception as e:
-        st.error(f"Profile loading error: {e}")
+def get_current_user_id():
+    """Return the logged-in user's ID."""
+
+    if st.session_state.user:
+        try:
+            return st.session_state.user.id
+        except Exception:
+            pass
 
     return None
 
 
-def refresh_profile():
-    if st.session_state.user:
-        st.session_state.profile = safe_get_profile(
-            st.session_state.user.id
-        )
+def normalize_text(text):
+    """Normalize text for better product matching."""
+
+    if not text:
+        return ""
+
+    text = str(text).lower().strip()
+
+    # Remove special characters
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+
+    # Remove extra spaces
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
-def get_company_id():
-    profile = st.session_state.profile
+def find_matching_product(product_name, master_products):
+    """
+    Find a master product that closely matches
+    the provided product name.
+    """
 
-    if not profile:
+    normalized_name = normalize_text(product_name)
+
+    if not normalized_name:
         return None
 
-    # Supports different possible column names
-    if "company_id" in profile and profile["company_id"]:
-        return profile["company_id"]
+    for product in master_products:
 
-    if "id" in profile:
-        return profile["id"]
-
-    return st.session_state.user.id
-
-
-def get_subscription_status():
-
-    profile = st.session_state.profile
-
-    if not profile:
-        return {
-            "access": False,
-            "plan": "none",
-            "reason": "Profile not found"
-        }
-
-    user_id = st.session_state.user.id
-
-    try:
-        payments = (
-            supabase
-            .table("payments")
-            .select("*")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .execute()
+        master_name = normalize_text(
+            product.get("product_name", "")
         )
 
-        payment_data = payments.data or []
+        # Exact match
+        if normalized_name == master_name:
+            return product
 
-    except Exception:
-        payment_data = []
-
-    # Check for lifetime plan
-    for payment in payment_data:
-
-        status = str(payment.get("status", "")).lower()
-        plan = str(payment.get("plan", "")).lower()
-
+        # One name contains the other
         if (
-            status in ["paid", "completed", "success"]
-            and plan in ["lifetime", "permanent"]
+            normalized_name in master_name
+            or master_name in normalized_name
         ):
-            return {
-                "access": True,
-                "plan": "Lifetime",
-                "reason": "Lifetime plan active"
-            }
+            return product
 
-    # Check monthly plan
-    for payment in payment_data:
-
-        status = str(payment.get("status", "")).lower()
-        plan = str(payment.get("plan", "")).lower()
-
-        if (
-            status in ["paid", "completed", "success"]
-            and plan == "monthly"
-        ):
-
-            created_at = payment.get("created_at")
-
-            if created_at:
-
-                try:
-
-                    payment_date = datetime.fromisoformat(
-                        created_at.replace("Z", "+00:00")
-                    )
-
-                    expiry = payment_date + timedelta(days=30)
-
-                    if now_utc() <= expiry:
-
-                        return {
-                            "access": True,
-                            "plan": "Monthly",
-                            "reason": f"Valid until {format_datetime(expiry)}"
-                        }
-
-                except Exception:
-                    pass
-
-    # Demo check
-    demo_started = profile.get("demo_started_at")
-
-    if demo_started:
-
-        try:
-
-            demo_start = datetime.fromisoformat(
-                demo_started.replace("Z", "+00:00")
-            )
-
-            demo_end = demo_start + timedelta(hours=DEMO_HOURS)
-
-            if now_utc() <= demo_end:
-
-                return {
-                    "access": True,
-                    "plan": "Demo",
-                    "reason": f"Demo active until {format_datetime(demo_end)}"
-                }
-
-        except Exception:
-            pass
-
-    return {
-        "access": False,
-        "plan": "Expired",
-        "reason": "No active subscription"
-    }
+    return None
 
 
-def start_demo(user_id):
-
-    profile = safe_get_profile(user_id)
-
-    if not profile:
-        return False
-
-    if profile.get("demo_started_at"):
-        return False
-
-    try:
-
-        supabase.table("profiles").update({
-            "demo_started_at": now_utc().isoformat()
-        }).eq("id", user_id).execute()
-
-        refresh_profile()
-
-        return True
-
-    except Exception as e:
-
-        st.error(f"Could not start demo: {e}")
-
-        return False
-
-
-def count_demo_pdfs():
-    """
-    Return the total number of PDF files used during the demo.
-
-    We sum pdf_count instead of counting database rows because one batch
-    can contain multiple uploaded PDFs.
-    """
-    if not st.session_state.user:
-        return 0
-
-    user_id = st.session_state.user.id
-
-    try:
-        response = (
-            supabase
-            .table("pdf_batches")
-            .select("pdf_count")
-            .eq("user_id", user_id)
-            .execute()
-        )
-
-        return sum(
-            int(batch.get("pdf_count", 0) or 0)
-            for batch in (response.data or [])
-        )
-
-    except Exception:
-        return 0
-
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-def is_existing_signup_response(user):
-    """
-    Supabase may intentionally hide whether an email already exists when
-    email confirmation is enabled. In that situation sign_up can return
-    a user object with an empty identities list.
-
-    This helper keeps that behavior in one place.
-    """
-    if user is None:
-        return False
-
-    identities = getattr(user, "identities", None)
-
-    return identities == []
-
+# =========================================================
+# AUTHENTICATION FUNCTIONS
+# =========================================================
 
 def login_user(email, password):
-    """Log in only with valid, email-confirmed Supabase credentials."""
-    email = email.strip().lower()
+    """Log a user into the application."""
 
     try:
-        response = supabase.auth.sign_in_with_password({
+
+        result = supabase.auth.sign_in_with_password({
             "email": email,
             "password": password
         })
 
-        user = getattr(response, "user", None)
-        session = getattr(response, "session", None)
+        st.session_state.user = result.user
 
-        if user is None or session is None:
-            st.session_state.user = None
-            st.session_state.profile = None
-            st.error("Incorrect email or password.")
-            return
+        load_user_profile()
 
-        # Supabase normally rejects unconfirmed users during sign-in.
-        # This extra check makes the confirmation requirement explicit.
-        if not getattr(user, "email_confirmed_at", None):
-            try:
-                supabase.auth.sign_out()
-            except Exception:
-                pass
-
-            st.session_state.user = None
-            st.session_state.profile = None
-            st.error("Please confirm your email before logging in.")
-            return
-
-        st.session_state.user = user
-        st.session_state.profile = safe_get_profile(user.id)
-        st.session_state.current_page = "Dashboard"
-
-        if st.session_state.profile is None:
-            # The user is authenticated, but the database setup is incomplete.
-            # Do not expose the dashboard until the company profile exists.
-            st.error(
-                "Login succeeded, but your company profile could not be loaded. "
-                "Please check the Supabase profile trigger and RLS policies."
-            )
-            return
-
-        st.success("Login successful! Opening your dashboard...")
-        st.rerun()
+        return True, "Login successful."
 
     except Exception as e:
-        st.session_state.user = None
-        st.session_state.profile = None
-
-        message = str(e).lower()
-
-        if (
-            "invalid login credentials" in message
-            or "invalid credentials" in message
-            or "invalid email or password" in message
-        ):
-            st.error("Incorrect email or password.")
-        elif (
-            "email not confirmed" in message
-            or "email not verified" in message
-        ):
-            st.error("Please confirm your email before logging in.")
-        else:
-            st.error("Login failed. Please try again.")
+        return False, str(e)
 
 
-def check_email_registered(email):
-    """
-    Check the Supabase database before sign-up so an existing email can
-    be reported clearly instead of relying on Supabase's obfuscated
-    sign_up response.
-    """
-    try:
-        result = supabase.rpc(
-            "is_email_registered",
-            {"check_email": email.strip().lower()}
-        ).execute()
-
-        return bool(getattr(result, "data", False))
-
-    except Exception as e:
-        # Do not silently continue if the SQL RPC has not been installed.
-        st.error(
-            "Unable to verify whether this email is already registered. "
-            "Please make sure the Supabase SQL setup has been run."
-        )
-        return None
-
-
-def resend_confirmation_email(email):
-    """Resend the Supabase signup confirmation email."""
-    email = email.strip().lower()
-
-    if not email:
-        st.warning("Please enter your email address first.")
-        return
-
-    try:
-        supabase.auth.resend({
-            "type": "signup",
-            "email": email
-        })
-
-        st.success(
-            "Confirmation email sent! Please check your inbox and spam folder."
-        )
-
-    except Exception as e:
-        message = str(e).lower()
-
-        if "rate limit" in message or "too many requests" in message:
-            st.error(
-                "Please wait a few minutes before requesting another confirmation email."
-            )
-        else:
-            st.error(
-                "Could not resend the confirmation email. Please try again later."
-            )
-
-
-def register_user(company_name, email, password):
-
-    company_name = company_name.strip()
-    email = email.strip().lower()
-
-    if not company_name:
-        st.error("Please enter a company name.")
-        return
-
-    if not email:
-        st.error("Please enter an email address.")
-        return
-
-    # Check first. This is required because Supabase can intentionally
-    # return a successful-looking response for an existing email when
-    # email confirmation is enabled.
-    email_registered = check_email_registered(email)
-
-    if email_registered is None:
-        return
-
-    if email_registered:
-        st.error(
-            "This email is already registered. Please log in instead."
-        )
-        return
+def signup_user(email, password):
+    """Create a new account."""
 
     try:
 
-        response = supabase.auth.sign_up({
+        result = supabase.auth.sign_up({
             "email": email,
-            "password": password,
-            "options": {
-                "data": {
-                    "company_name": company_name
-                }
-            }
+            "password": password
         })
 
-        user = getattr(response, "user", None)
-
-        if not user:
-            st.error(
-                "Registration could not be completed. Please try again."
-            )
-            return
-
-        # Safety check for Supabase's obfuscated duplicate-email response.
-        if is_existing_signup_response(user):
-            st.error(
-                "This email is already registered. Please log in instead."
-            )
-            return
-
-        session = getattr(response, "session", None)
-
-        if session is None:
-            st.success(
-                "Account created successfully! Please check your email and "
-                "confirm your account before logging in."
-            )
-        else:
-            st.success(
-                "Account created successfully! Please log in."
-            )
+        return True, (
+            "Account created successfully. "
+            "Please verify your email if verification is enabled."
+        )
 
     except Exception as e:
+        return False, str(e)
 
-        error_message = str(e).lower()
 
-        if (
-            "already registered" in error_message
-            or "already exists" in error_message
-            or "user already registered" in error_message
-            or "email_exists" in error_message
-            or "duplicate" in error_message
-            or "email address is already in use" in error_message
-        ):
-            st.error(
-                "This email is already registered. Please log in instead."
-            )
-        elif "password" in error_message and "least" in error_message:
-            st.error(
-                "Password does not meet the required security requirements."
-            )
-        else:
-            st.error(f"Registration failed: {e}")
-
-def logout():
+def logout_user():
 
     try:
         supabase.auth.sign_out()
@@ -556,208 +176,83 @@ def logout():
 
     st.session_state.user = None
     st.session_state.profile = None
-    st.session_state.batch_results = None
-    st.session_state.current_page = "Dashboard"
 
     st.rerun()
 
 
-# ============================================================
-# PDF FUNCTIONS
-# ============================================================
+# =========================================================
+# PROFILE FUNCTIONS
+# =========================================================
 
-def extract_text_from_page(page):
+def load_user_profile():
+    """
+    Load the user's profile.
 
-    try:
-        return page.get_text("text")
-    except Exception:
-        return ""
+    This safely handles missing permissions or
+    missing profile records.
+    """
 
+    user_id = get_current_user_id()
 
-def normalize_text(text):
-
-    if not text:
-        return ""
-
-    text = text.lower()
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def find_matching_master_product(page_text, mappings):
-
-    normalized_page_text = normalize_text(page_text)
-
-    best_match = None
-
-    for mapping in mappings:
-
-        sku = str(mapping.get("sku", "")).strip()
-
-        if not sku:
-            continue
-
-        if sku.lower() in normalized_page_text:
-
-            master_product = mapping.get("master_product_name")
-
-            if master_product:
-                return master_product
-
-    # Also try master product names
-    for mapping in mappings:
-
-        master_product = str(
-            mapping.get("master_product_name", "")
-        ).strip()
-
-        if master_product and master_product.lower() in normalized_page_text:
-            best_match = master_product
-            break
-
-    return best_match
-
-
-def get_user_mappings():
-
-    company_id = get_company_id()
-
-    if not company_id:
-        return []
+    if not user_id:
+        return None
 
     try:
 
         response = (
             supabase
-            .table("sku_mappings")
+            .table("profiles")
             .select("*")
-            .eq("company_id", company_id)
+            .eq("id", user_id)
             .execute()
         )
 
-        return response.data or []
+        if response.data and len(response.data) > 0:
+
+            st.session_state.profile = response.data[0]
+
+            return response.data[0]
+
+        return None
 
     except Exception as e:
 
-        st.error(f"Could not load SKU mappings: {e}")
+        # Don't crash the entire application
+        st.session_state.profile = None
 
-        return []
-
-
-def reorganize_pdfs(uploaded_files):
-
-    mappings = get_user_mappings()
-
-    categorized_pages = {}
-    uncategorized_pages = []
-
-    for uploaded_file in uploaded_files:
-
-        pdf_bytes = uploaded_file.read()
-
-        document = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-
-        for page_number in range(len(document)):
-
-            page = document.load_page(page_number)
-
-            page_text = extract_text_from_page(page)
-
-            master_product = find_matching_master_product(
-                page_text,
-                mappings
-            )
-
-            # Preserve original page exactly
-            single_page_pdf = fitz.open()
-            single_page_pdf.insert_pdf(
-                document,
-                from_page=page_number,
-                to_page=page_number
-            )
-
-            if master_product:
-
-                if master_product not in categorized_pages:
-                    categorized_pages[master_product] = []
-
-                categorized_pages[master_product].append(
-                    single_page_pdf
-                )
-
-            else:
-
-                uncategorized_pages.append(single_page_pdf)
-
-        document.close()
-
-    return categorized_pages, uncategorized_pages
+        return None
 
 
-def create_reorganized_pdf(categorized_pages, uncategorized_pages):
+def get_company_name():
 
-    output = fitz.open()
+    profile = st.session_state.profile
 
-    ordered_products = sorted(
-        categorized_pages.keys(),
-        key=lambda x: x.lower()
-    )
+    if not profile:
+        return "My Company"
 
-    for product in ordered_products:
+    possible_columns = [
+        "company_name",
+        "business_name",
+        "name"
+    ]
 
-        for page_document in categorized_pages[product]:
+    for column in possible_columns:
 
-            output.insert_pdf(page_document)
+        if profile.get(column):
+            return profile.get(column)
 
-    # Uncategorized pages at the end
-    for page_document in uncategorized_pages:
-        output.insert_pdf(page_document)
-
-    output_bytes = output.tobytes()
-
-    output.close()
-
-    return output_bytes
+    return "My Company"
 
 
-def create_pickup_list(categorized_pages):
+# =========================================================
+# MASTER PRODUCT FUNCTIONS
+# =========================================================
 
-    pickup_data = []
+def get_master_products():
 
-    for product, pages in categorized_pages.items():
+    user_id = get_current_user_id()
 
-        pickup_data.append({
-            "Master Product": product,
-            "Labels / Orders": len(pages)
-        })
-
-    if not pickup_data:
-        return pd.DataFrame(
-            columns=["Master Product", "Labels / Orders"]
-        )
-
-    dataframe = pd.DataFrame(pickup_data)
-
-    dataframe = dataframe.sort_values(
-        by="Master Product"
-    )
-
-    return dataframe
-
-
-# ============================================================
-# INVENTORY FUNCTIONS
-# ============================================================
-
-def get_inventory():
-
-    company_id = get_company_id()
-
-    if not company_id:
+    if not user_id:
         return []
 
     try:
@@ -766,8 +261,8 @@ def get_inventory():
             supabase
             .table("master_products")
             .select("*")
-            .eq("company_id", company_id)
-            .order("name")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
             .execute()
         )
 
@@ -775,165 +270,297 @@ def get_inventory():
 
     except Exception as e:
 
-        st.error(f"Inventory loading error: {e}")
+        st.error(f"Could not load master products: {e}")
 
         return []
 
 
-def update_inventory(product_id, new_quantity):
+def add_master_product(
+    product_name,
+    inventory_quantity,
+    minimum_stock
+):
+
+    user_id = get_current_user_id()
+
+    if not user_id:
+        return False, "User is not logged in."
 
     try:
 
-        supabase.table("master_products").update({
-            "quantity": int(new_quantity)
-        }).eq("id", product_id).execute()
+        data = {
+            "user_id": user_id,
+            "product_name": product_name,
+            "inventory_quantity": int(inventory_quantity)
+        }
 
-        return True
+        # Try to include minimum_stock if your table has it
+        try:
+            data["minimum_stock"] = int(minimum_stock)
+
+            response = (
+                supabase
+                .table("master_products")
+                .insert(data)
+                .execute()
+            )
+
+        except Exception:
+
+            # Remove unsupported column and try again
+            data.pop("minimum_stock", None)
+
+            response = (
+                supabase
+                .table("master_products")
+                .insert(data)
+                .execute()
+            )
+
+        return True, "Master product added successfully."
 
     except Exception as e:
 
-        st.error(f"Inventory update failed: {e}")
-
-        return False
+        return False, str(e)
 
 
-def deduct_inventory_from_pickup(pickup_dataframe):
+def delete_master_product(product_id):
 
-    inventory = get_inventory()
+    user_id = get_current_user_id()
 
-    inventory_lookup = {}
+    if not user_id:
+        return False, "User is not logged in."
 
-    for item in inventory:
+    try:
 
-        name = str(
-            item.get("name")
-            or item.get("master_product_name")
-            or ""
-        ).strip().lower()
-
-        inventory_lookup[name] = item
-
-    successful = 0
-    failed = []
-
-    for _, row in pickup_dataframe.iterrows():
-
-        product_name = str(
-            row["Master Product"]
-        ).strip()
-
-        quantity_needed = int(
-            row["Labels / Orders"]
+        (
+            supabase
+            .table("master_products")
+            .delete()
+            .eq("id", product_id)
+            .eq("user_id", user_id)
+            .execute()
         )
 
-        inventory_item = inventory_lookup.get(
-            product_name.lower()
+        return True, "Product deleted successfully."
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+def update_product_inventory(product_id, quantity):
+
+    user_id = get_current_user_id()
+
+    if not user_id:
+        return False, "User is not logged in."
+
+    try:
+
+        (
+            supabase
+            .table("master_products")
+            .update({
+                "inventory_quantity": int(quantity)
+            })
+            .eq("id", product_id)
+            .eq("user_id", user_id)
+            .execute()
         )
 
-        if not inventory_item:
+        return True, "Inventory updated successfully."
 
-            failed.append(
-                f"{product_name}: Not found in inventory"
-            )
+    except Exception as e:
 
-            continue
+        return False, str(e)
+
+
+# =========================================================
+# SKU MAPPING FUNCTIONS
+# =========================================================
+
+def get_sku_mappings():
+
+    user_id = get_current_user_id()
+
+    if not user_id:
+        return []
+
+    try:
+
+        response = (
+            supabase
+            .table("sku_mappings")
+            .select("*")
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        return response.data or []
+
+    except Exception as e:
+
+        return []
+
+
+def add_sku_mapping(
+    master_product_id,
+    sku,
+    account_name=""
+):
+
+    user_id = get_current_user_id()
+
+    if not user_id:
+        return False, "User is not logged in."
+
+    try:
+
+        data = {
+            "user_id": user_id,
+            "master_product_id": master_product_id,
+            "sku": sku
+        }
+
+        # Account name is optional
+        if account_name:
+            data["account_name"] = account_name
+
+        supabase.table(
+            "sku_mappings"
+        ).insert(data).execute()
+
+        return True, "SKU mapping added successfully."
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+def delete_sku_mapping(mapping_id):
+
+    user_id = get_current_user_id()
+
+    try:
+
+        (
+            supabase
+            .table("sku_mappings")
+            .delete()
+            .eq("id", mapping_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        return True, "SKU mapping deleted."
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+# =========================================================
+# INVENTORY FUNCTIONS
+# =========================================================
+
+def update_inventory_after_order(
+    product_id,
+    quantity_sold
+):
+
+    user_id = get_current_user_id()
+
+    if not user_id:
+        return False, "User not logged in."
+
+    try:
+
+        product_response = (
+            supabase
+            .table("master_products")
+            .select("*")
+            .eq("id", product_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        if not product_response.data:
+            return False, "Product not found."
+
+        product = product_response.data[0]
 
         current_quantity = int(
-            inventory_item.get("quantity", 0)
+            product.get("inventory_quantity", 0)
         )
 
         new_quantity = max(
-            0,
-            current_quantity - quantity_needed
+            current_quantity - int(quantity_sold),
+            0
         )
 
-        if update_inventory(
-            inventory_item["id"],
-            new_quantity
-        ):
-
-            successful += 1
-
-            try:
-
-                supabase.table(
-                    "inventory_history"
-                ).insert({
-                    "company_id": get_company_id(),
-                    "master_product_id": inventory_item["id"],
-                    "change_quantity": -quantity_needed,
-                    "reason": "Pick-up list inventory deduction"
-                }).execute()
-
-            except Exception:
-                pass
-
-    return successful, failed
-
-
-# ============================================================
-# LOW STOCK FUNCTION
-# ============================================================
-
-def get_low_stock_products():
-
-    inventory = get_inventory()
-
-    low_stock = []
-
-    for product in inventory:
-
-        quantity = int(
-            product.get("quantity", 0) or 0
+        (
+            supabase
+            .table("master_products")
+            .update({
+                "inventory_quantity": new_quantity
+            })
+            .eq("id", product_id)
+            .eq("user_id", user_id)
+            .execute()
         )
 
-        minimum_stock = int(
-            product.get("minimum_stock", 0) or 0
-        )
+        # Try saving inventory history
+        try:
 
-        if quantity <= minimum_stock:
+            history_data = {
+                "user_id": user_id,
+                "master_product_id": product_id,
+                "quantity": int(quantity_sold),
+                "type": "OUT"
+            }
 
-            low_stock.append(product)
+            supabase.table(
+                "inventory_history"
+            ).insert(history_data).execute()
 
-    return low_stock
+        except Exception:
+            pass
+
+        return True, "Inventory updated."
+
+    except Exception as e:
+
+        return False, str(e)
 
 
-# ============================================================
-# AUTH SCREEN
-# ============================================================
+# =========================================================
+# LOGIN PAGE
+# =========================================================
 
-def show_auth_page():
+def show_login_page():
 
     st.title("📦 Meesho Label Organizer")
 
     st.markdown(
-        """
-        ### Organize your Meesho labels intelligently
-
-        - Group multiple SKUs under Master Products
-        - Generate organized PDF labels
-        - Create Pick-Up Lists
-        - Manage inventory
-        - Track low stock
-        - Access your company data from multiple devices
-        """
+        "### Organize your Meesho labels, SKUs and inventory."
     )
 
-    login_tab, register_tab = st.tabs([
-        "🔐 Login",
-        "📝 Register"
+    tab1, tab2 = st.tabs([
+        "Login",
+        "Create Account"
     ])
 
-    with login_tab:
+    with tab1:
 
-        st.subheader("Login to your company account")
+        st.subheader("Login")
 
-        login_email = st.text_input(
+        email = st.text_input(
             "Email",
             key="login_email"
         )
 
-        login_password = st.text_input(
+        password = st.text_input(
             "Password",
             type="password",
             key="login_password"
@@ -941,11 +568,10 @@ def show_auth_page():
 
         if st.button(
             "Login",
-            type="primary",
             use_container_width=True
         ):
 
-            if not login_email or not login_password:
+            if not email or not password:
 
                 st.warning(
                     "Please enter your email and password."
@@ -953,29 +579,36 @@ def show_auth_page():
 
             else:
 
-                login_user(
-                    login_email,
-                    login_password
+                success, message = login_user(
+                    email,
+                    password
                 )
 
-    with register_tab:
+                if success:
 
-        st.subheader("Create your company account")
+                    st.success(message)
 
-        company_name = st.text_input(
-            "Company Name",
-            placeholder="Example: Jokerwal Brothers"
-        )
+                    st.rerun()
 
-        register_email = st.text_input(
+                else:
+
+                    st.error(
+                        f"Login failed: {message}"
+                    )
+
+    with tab2:
+
+        st.subheader("Create Account")
+
+        email = st.text_input(
             "Email",
-            key="register_email"
+            key="signup_email"
         )
 
-        register_password = st.text_input(
+        password = st.text_input(
             "Password",
             type="password",
-            key="register_password"
+            key="signup_password"
         )
 
         confirm_password = st.text_input(
@@ -983,348 +616,170 @@ def show_auth_page():
             type="password"
         )
 
-        st.info(
-            f"""
-            💳 Monthly Plan: ₹{MONTHLY_PRICE}/month
-
-            💎 Lifetime Plan: ₹{LIFETIME_PRICE} one-time
-
-            🆓 Demo: {DEMO_HOURS} hours with a maximum
-            of {DEMO_PDF_LIMIT} PDF uploads.
-            """
-        )
-
-        st.caption(
-            "Already registered but did not receive your confirmation email?"
-        )
-
-        if st.button(
-            "📧 Resend Confirmation Email",
-            use_container_width=True,
-            key="resend_confirmation_email_button"
-        ):
-            resend_confirmation_email(register_email)
-
         if st.button(
             "Create Account",
-            type="primary",
             use_container_width=True
         ):
 
-            if not all([
-                company_name,
-                register_email,
-                register_password,
-                confirm_password
-            ]):
-
-                st.warning(
-                    "Please complete all fields."
-                )
-
-            elif register_password != confirm_password:
+            if password != confirm_password:
 
                 st.error(
                     "Passwords do not match."
                 )
 
-            elif len(register_password) < 6:
+            elif len(password) < 6:
 
                 st.error(
-                    "Password should contain at least 6 characters."
+                    "Password must contain at least 6 characters."
                 )
 
             else:
 
-                register_user(
-                    company_name,
-                    register_email,
-                    register_password
+                success, message = signup_user(
+                    email,
+                    password
                 )
 
+                if success:
+                    st.success(message)
 
-# ============================================================
-# SUBSCRIPTION SCREEN
-# ============================================================
-
-def show_subscription_page():
-
-    st.title("Choose Your Plan")
-
-    user_id = st.session_state.user.id
-
-    current_status = get_subscription_status()
-
-    if current_status["access"]:
-
-        st.success(
-            f"Your {current_status['plan']} access is active."
-        )
-
-        st.info(current_status["reason"])
-
-        if st.button("Go to Dashboard"):
-            st.session_state.current_page = "Dashboard"
-            st.rerun()
-
-        return
-
-    demo_started = (
-        st.session_state.profile.get("demo_started_at")
-        if st.session_state.profile
-        else None
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        st.subheader("🆓 Demo")
-
-        st.write(f"⏰ {DEMO_HOURS} hours access")
-        st.write(f"📄 Maximum {DEMO_PDF_LIMIT} PDFs")
-        st.write("📦 Full inventory access")
-        st.write("📋 Pick-up list generation")
-
-        if not demo_started:
-
-            if st.button(
-                "Start Free Demo",
-                use_container_width=True
-            ):
-
-                if start_demo(user_id):
-
-                    st.success("Demo started!")
-                    st.rerun()
-
-        else:
-
-            st.warning("Demo already used.")
-
-    with col2:
-
-        st.subheader("💳 Monthly")
-
-        st.markdown(
-            f"# ₹{MONTHLY_PRICE}"
-        )
-
-        st.write("Per month")
-
-        st.write("✓ Full access")
-        st.write("✓ Unlimited PDF processing")
-        st.write("✓ Inventory management")
-        st.write("✓ Multi-device access")
-
-        if st.button(
-            "Choose Monthly Plan",
-            use_container_width=True,
-            type="primary"
-        ):
-
-            create_payment_record(
-                "monthly",
-                MONTHLY_PRICE
-            )
-
-    with col3:
-
-        st.subheader("💎 Lifetime")
-
-        st.markdown(
-            f"# ₹{LIFETIME_PRICE}"
-        )
-
-        st.write("One-time payment")
-
-        st.write("✓ Lifetime access")
-        st.write("✓ No monthly payment")
-        st.write("✓ All features")
-        st.write("✓ Multi-device access")
-
-        if st.button(
-            "Choose Lifetime Plan",
-            use_container_width=True,
-            type="primary"
-        ):
-
-            create_payment_record(
-                "lifetime",
-                LIFETIME_PRICE
-            )
+                else:
+                    st.error(message)
 
 
-# ============================================================
-# PAYMENT RECORD
-# ============================================================
-
-def create_payment_record(plan, amount):
-
-    """
-    Temporary payment workflow.
-
-    IMPORTANT:
-    This creates a pending payment record only.
-
-    For real automatic payments we will connect
-    Razorpay next.
-    """
-
-    try:
-
-        response = (
-            supabase
-            .table("payments")
-            .insert({
-                "user_id": st.session_state.user.id,
-                "company_id": get_company_id(),
-                "plan": plan,
-                "amount": amount,
-                "status": "pending"
-            })
-            .execute()
-        )
-
-        st.info(
-            """
-            Payment record created.
-
-            The next step is connecting Razorpay so the
-            customer can actually pay online and the payment
-            can automatically activate their subscription.
-            """
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Payment initialization failed: {e}"
-        )
-
-
-# ============================================================
+# =========================================================
 # DASHBOARD
-# ============================================================
+# =========================================================
 
 def show_dashboard():
 
     st.title("📦 Meesho Label Organizer Dashboard")
 
-    profile = st.session_state.profile
+    company_name = get_company_name()
 
-    company_name = (
-        profile.get("company_name", "Your Company")
-        if profile
-        else "Your Company"
+    st.markdown(
+        f"## Welcome, {company_name} 👋"
     )
 
-    st.write(f"### Welcome, {company_name} 👋")
+    products = get_master_products()
 
-    subscription = get_subscription_status()
+    total_products = len(products)
 
-    st.caption(
-        f"Plan: {subscription['plan']} | "
-        f"{subscription['reason']}"
+    total_inventory = sum(
+        int(
+            product.get(
+                "inventory_quantity",
+                0
+            ) or 0
+        )
+        for product in products
     )
 
-    inventory = get_inventory()
-    low_stock = get_low_stock_products()
+    low_stock_products = []
+
+    for product in products:
+
+        quantity = int(
+            product.get(
+                "inventory_quantity",
+                0
+            ) or 0
+        )
+
+        minimum_stock = int(
+            product.get(
+                "minimum_stock",
+                0
+            ) or 0
+        )
+
+        if minimum_stock > 0:
+
+            if quantity <= minimum_stock:
+
+                low_stock_products.append(
+                    product
+                )
 
     col1, col2, col3 = st.columns(3)
 
-    with col1:
-        st.metric(
-            "Master Products",
-            len(inventory)
-        )
+    col1.metric(
+        "Master Products",
+        total_products
+    )
 
-    with col2:
+    col2.metric(
+        "Total Inventory",
+        total_inventory
+    )
 
-        total_inventory = sum(
-            int(item.get("quantity", 0) or 0)
-            for item in inventory
-        )
-
-        st.metric(
-            "Total Inventory",
-            total_inventory
-        )
-
-    with col3:
-
-        st.metric(
-            "Low Stock Products",
-            len(low_stock)
-        )
+    col3.metric(
+        "Low Stock Products",
+        len(low_stock_products)
+    )
 
     st.divider()
 
-    if low_stock:
+    if low_stock_products:
 
-        st.error("⚠️ LOW STOCK ALERTS")
+        st.warning(
+            "⚠️ Some products have reached "
+            "their minimum stock limit."
+        )
 
-        for product in low_stock:
+        for product in low_stock_products:
 
-            name = (
-                product.get("name")
-                or product.get("master_product_name")
-                or "Unnamed Product"
-            )
-
-            quantity = product.get(
-                "quantity",
-                0
-            )
-
-            minimum = product.get(
-                "minimum_stock",
-                0
-            )
-
-            st.warning(
-                f"📦 **{name}** — "
-                f"Current Stock: {quantity} | "
-                f"Minimum Limit: {minimum}"
+            st.write(
+                f"**{product.get('product_name')}** "
+                f"- Stock: "
+                f"{product.get('inventory_quantity', 0)}"
             )
 
     else:
 
         st.success(
-            "✅ All products are currently above their minimum stock limits."
+            "✅ All products are currently "
+            "above their minimum stock limits."
         )
 
 
-# ============================================================
-# MASTER PRODUCTS
-# ============================================================
+# =========================================================
+# MASTER PRODUCTS PAGE
+# =========================================================
 
 def show_master_products():
 
-    st.title("🏷️ Master Products")
-
-    company_id = get_company_id()
+    st.title("📦 Master Products")
 
     with st.expander(
         "➕ Add New Master Product",
-        expanded=False
+        expanded=True
     ):
 
         product_name = st.text_input(
-            "Master Product Name"
+            "Product Name",
+            placeholder="Example: Jali Combo"
         )
 
-        initial_quantity = st.number_input(
-            "Initial Inventory Quantity",
-            min_value=0,
-            step=1
-        )
+        col1, col2 = st.columns(2)
 
-        minimum_stock = st.number_input(
-            "Minimum Stock Alert Limit",
-            min_value=0,
-            step=1
-        )
+        with col1:
+
+            inventory_quantity = st.number_input(
+                "Initial Inventory Quantity",
+                min_value=0,
+                value=0,
+                step=1
+            )
+
+        with col2:
+
+            minimum_stock = st.number_input(
+                "Minimum Stock Alert Limit",
+                min_value=0,
+                value=0,
+                step=1
+            )
 
         if st.button(
             "Add Master Product",
@@ -1333,96 +788,121 @@ def show_master_products():
 
             if not product_name.strip():
 
-                st.warning(
+                st.error(
                     "Please enter a product name."
                 )
 
             else:
 
-                try:
+                success, message = add_master_product(
+                    product_name.strip(),
+                    inventory_quantity,
+                    minimum_stock
+                )
 
-                    supabase.table(
-                        "master_products"
-                    ).insert({
-                        "company_id": company_id,
-                        "name": product_name.strip(),
-                        "quantity": int(initial_quantity),
-                        "minimum_stock": int(minimum_stock)
-                    }).execute()
+                if success:
 
-                    st.success(
-                        "Master product added successfully!"
-                    )
+                    st.success(message)
 
                     st.rerun()
 
-                except Exception as e:
+                else:
 
                     st.error(
-                        f"Could not add product: {e}"
+                        f"Could not add product: {message}"
                     )
 
-    inventory = get_inventory()
+    st.divider()
 
-    if inventory:
+    products = get_master_products()
 
-        display_data = []
-
-        for item in inventory:
-
-            display_data.append({
-                "ID": item.get("id"),
-                "Master Product":
-                    item.get("name")
-                    or item.get("master_product_name"),
-                "Quantity":
-                    item.get("quantity", 0),
-                "Minimum Stock":
-                    item.get("minimum_stock", 0)
-            })
-
-        st.dataframe(
-            pd.DataFrame(display_data),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
+    if not products:
 
         st.info(
             "No Master Products have been created yet."
         )
 
+        return
 
-# ============================================================
-# SKU MAPPINGS
-# ============================================================
+    st.subheader("Your Master Products")
+
+    for product in products:
+
+        product_id = product.get("id")
+
+        with st.container(border=True):
+
+            col1, col2, col3 = st.columns(
+                [4, 2, 1]
+            )
+
+            with col1:
+
+                st.subheader(
+                    product.get(
+                        "product_name",
+                        "Unnamed Product"
+                    )
+                )
+
+                st.caption(
+                    f"Product ID: {product_id}"
+                )
+
+            with col2:
+
+                st.metric(
+                    "Inventory",
+                    product.get(
+                        "inventory_quantity",
+                        0
+                    )
+                )
+
+            with col3:
+
+                if st.button(
+                    "🗑️",
+                    key=f"delete_product_{product_id}"
+                ):
+
+                    success, message = delete_master_product(
+                        product_id
+                    )
+
+                    if success:
+
+                        st.success(message)
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(message)
+
+
+# =========================================================
+# SKU MAPPINGS PAGE
+# =========================================================
 
 def show_sku_mappings():
 
-    st.title("🔗 SKU → Master Product Mapping")
+    st.title("🔗 SKU Mappings")
 
-    inventory = get_inventory()
+    products = get_master_products()
 
-    if not inventory:
+    if not products:
 
         st.warning(
-            "Please create at least one Master Product first."
+            "Create a Master Product before adding SKU mappings."
         )
 
         return
 
-    product_names = []
-
-    for product in inventory:
-
-        name = (
-            product.get("name")
-            or product.get("master_product_name")
-        )
-
-        if name:
-            product_names.append(name)
+    product_options = {
+        product["product_name"]: product["id"]
+        for product in products
+    }
 
     with st.expander(
         "➕ Add SKU Mapping",
@@ -1431,426 +911,291 @@ def show_sku_mappings():
 
         selected_product = st.selectbox(
             "Select Master Product",
-            product_names
+            list(product_options.keys())
         )
 
         sku = st.text_input(
-            "SKU"
+            "SKU",
+            placeholder="Enter the Meesho SKU"
+        )
+
+        account_name = st.text_input(
+            "Account Name (Optional)",
+            placeholder="Example: Account 1"
         )
 
         if st.button(
-            "Save SKU Mapping",
+            "Add SKU Mapping",
             type="primary"
         ):
 
             if not sku.strip():
 
-                st.warning(
+                st.error(
                     "Please enter an SKU."
                 )
 
             else:
 
-                try:
+                product_id = product_options[
+                    selected_product
+                ]
 
-                    supabase.table(
-                        "sku_mappings"
-                    ).insert({
-                        "company_id": get_company_id(),
-                        "master_product_name":
-                            selected_product,
-                        "sku": sku.strip()
-                    }).execute()
+                success, message = add_sku_mapping(
+                    product_id,
+                    sku.strip(),
+                    account_name.strip()
+                )
 
-                    st.success(
-                        f"SKU '{sku}' mapped to '{selected_product}'."
-                    )
+                if success:
+
+                    st.success(message)
 
                     st.rerun()
 
-                except Exception as e:
+                else:
 
                     st.error(
-                        f"Could not save mapping: {e}"
+                        f"Could not add SKU: {message}"
                     )
 
-    mappings = get_user_mappings()
+    st.divider()
 
-    if mappings:
+    mappings = get_sku_mappings()
 
-        dataframe = pd.DataFrame(mappings)
-
-        columns_to_show = [
-            column
-            for column in [
-                "master_product_name",
-                "sku"
-            ]
-            if column in dataframe.columns
-        ]
-
-        st.dataframe(
-            dataframe[columns_to_show],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
+    if not mappings:
 
         st.info(
             "No SKU mappings have been created yet."
         )
 
+        return
 
-# ============================================================
-# PDF ORGANIZER
-# ============================================================
+    product_lookup = {
+        product["id"]: product.get(
+            "product_name",
+            "Unknown Product"
+        )
+        for product in products
+    }
+
+    display_data = []
+
+    for mapping in mappings:
+
+        display_data.append({
+            "Master Product": product_lookup.get(
+                mapping.get("master_product_id"),
+                "Unknown Product"
+            ),
+            "SKU": mapping.get("sku", ""),
+            "Account": mapping.get(
+                "account_name",
+                ""
+            )
+        })
+
+    st.dataframe(
+        pd.DataFrame(display_data),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# =========================================================
+# INVENTORY PAGE
+# =========================================================
+
+def show_inventory():
+
+    st.title("📊 Inventory")
+
+    products = get_master_products()
+
+    if not products:
+
+        st.info(
+            "No products available."
+        )
+
+        return
+
+    rows = []
+
+    for product in products:
+
+        quantity = int(
+            product.get(
+                "inventory_quantity",
+                0
+            ) or 0
+        )
+
+        minimum_stock = int(
+            product.get(
+                "minimum_stock",
+                0
+            ) or 0
+        )
+
+        status = "Good"
+
+        if minimum_stock > 0 and quantity <= minimum_stock:
+            status = "Low Stock"
+
+        rows.append({
+            "Product": product.get(
+                "product_name"
+            ),
+            "Quantity": quantity,
+            "Minimum Stock": minimum_stock,
+            "Status": status
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+
+    st.subheader("Update Inventory")
+
+    product_options = {
+        product["product_name"]: product
+        for product in products
+    }
+
+    selected_name = st.selectbox(
+        "Select Product",
+        list(product_options.keys())
+    )
+
+    selected_product = product_options[
+        selected_name
+    ]
+
+    new_quantity = st.number_input(
+        "New Inventory Quantity",
+        min_value=0,
+        value=int(
+            selected_product.get(
+                "inventory_quantity",
+                0
+            ) or 0
+        )
+    )
+
+    if st.button(
+        "Update Inventory",
+        type="primary"
+    ):
+
+        success, message = update_product_inventory(
+            selected_product["id"],
+            new_quantity
+        )
+
+        if success:
+
+            st.success(message)
+
+            st.rerun()
+
+        else:
+
+            st.error(message)
+
+
+# =========================================================
+# PDF ORGANIZER PAGE
+# =========================================================
 
 def show_pdf_organizer():
 
     st.title("📄 PDF Label Organizer")
 
-    subscription = get_subscription_status()
-
-    if not subscription["access"]:
-
-        st.warning(
-            "You need an active plan or demo to use this feature."
-        )
-
-        if st.button("View Plans"):
-            st.session_state.current_page = "Subscription"
-            st.rerun()
-
-        return
-
-    used_pdfs = 0
-
-    if subscription["plan"] == "Demo":
-
-        used_pdfs = count_demo_pdfs()
-
-        remaining_pdfs = max(
-            0,
-            DEMO_PDF_LIMIT - used_pdfs
-        )
-
-        st.info(
-            f"Demo usage: {used_pdfs}/{DEMO_PDF_LIMIT} PDFs "
-            f"({remaining_pdfs} remaining)"
-        )
-
-        if remaining_pdfs <= 0:
-
-            st.error(
-                "Your demo PDF limit has been reached."
-            )
-
-            return
-
-    uploaded_files = st.file_uploader(
-        "Upload Meesho Label PDFs",
-        type=["pdf"],
-        accept_multiple_files=True
+    st.write(
+        "Upload Meesho label PDFs here. "
+        "This section will be used to organize "
+        "labels according to your Master Product and SKU mappings."
     )
 
-    if uploaded_files:
+    uploaded_file = st.file_uploader(
+        "Upload Meesho Label PDF",
+        type=["pdf"]
+    )
 
-        selected_pdf_count = len(uploaded_files)
+    if uploaded_file:
 
-        st.info(
-            f"{selected_pdf_count} PDF file(s) selected."
+        st.success(
+            f"Uploaded: {uploaded_file.name}"
         )
 
-        if (
-            subscription["plan"] == "Demo"
-            and used_pdfs + selected_pdf_count > DEMO_PDF_LIMIT
-        ):
-            remaining_pdfs = max(
-                0,
-                DEMO_PDF_LIMIT - used_pdfs
-            )
+        st.info(
+            "PDF processing can now be connected "
+            "to your SKU mapping system."
+        )
 
-            st.error(
-                f"You can upload only {remaining_pdfs} more PDF(s) during "
-                "your demo."
-            )
+        # Save PDF batch record if possible
+        user_id = get_current_user_id()
 
-            return
+        if user_id:
 
-        if st.button(
-            "🚀 Organize Labels",
-            type="primary",
-            use_container_width=True
-        ):
+            try:
 
-            with st.spinner(
-                "Analyzing and organizing your labels..."
-            ):
-
-                categorized, uncategorized = reorganize_pdfs(
-                    uploaded_files
-                )
-
-                st.session_state.batch_results = {
-                    "categorized": categorized,
-                    "uncategorized": uncategorized
+                data = {
+                    "user_id": user_id,
+                    "file_name": uploaded_file.name
                 }
 
-                # Save batch information
-                try:
+                supabase.table(
+                    "pdf_batches"
+                ).insert(data).execute()
 
-                    supabase.table(
-                        "pdf_batches"
-                    ).insert({
-                        "user_id": st.session_state.user.id,
-                        "company_id": get_company_id(),
-                        "pdf_count": len(uploaded_files)
-                    }).execute()
+            except Exception:
+                pass
 
-                except Exception:
-                    pass
 
-                st.success(
-                    "Labels organized successfully!"
-                )
+# =========================================================
+# SUBSCRIPTION PAGE
+# =========================================================
 
-    results = st.session_state.batch_results
+def show_subscription():
 
-    if results:
+    st.title("💳 Subscription")
 
-        categorized = results["categorized"]
-        uncategorized = results["uncategorized"]
-
-        st.divider()
-
-        st.subheader("📊 Organization Results")
-
-        total_categorized = sum(
-            len(pages)
-            for pages in categorized.values()
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.metric(
-                "Master Product Categories",
-                len(categorized)
-            )
-
-        with col2:
-            st.metric(
-                "Organized Labels",
-                total_categorized
-            )
-
-        with col3:
-            st.metric(
-                "Uncategorized Labels",
-                len(uncategorized)
-            )
-
-        pickup_dataframe = create_pickup_list(
-            categorized
-        )
-
-        st.subheader("📋 Pick-Up List")
-
-        st.dataframe(
-            pickup_dataframe,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv_data = pickup_dataframe.to_csv(
-            index=False
-        ).encode("utf-8")
-
-        st.download_button(
-            "⬇️ Download Pick-Up List CSV",
-            data=csv_data,
-            file_name="pickup_list.csv",
-            mime="text/csv"
-        )
-
-        st.subheader("📦 Inventory Action")
-
-        st.warning(
-            "This will subtract the quantities in the Pick-Up List "
-            "from your current inventory."
-        )
-
-        if st.button(
-            "➖ Deduct Pick-Up List From Inventory",
-            type="primary"
-        ):
-
-            success_count, failed = (
-                deduct_inventory_from_pickup(
-                    pickup_dataframe
-                )
-            )
-
-            if success_count:
-
-                st.success(
-                    f"Inventory updated for {success_count} product(s)."
-                )
-
-            if failed:
-
-                for error in failed:
-                    st.error(error)
-
-        st.divider()
-
-        st.subheader("📄 Download Reorganized Labels")
-
-        if categorized:
-
-            output_pdf = create_reorganized_pdf(
-                categorized,
-                uncategorized
-            )
-
-            st.download_button(
-                "⬇️ Download Reorganized PDF",
-                data=output_pdf,
-                file_name="reorganized_meesho_labels.pdf",
-                mime="application/pdf",
-                type="primary",
-                use_container_width=True
-            )
-
-        st.subheader("Master Product Statistics")
-
-        for product, pages in categorized.items():
-
-            st.write(
-                f"**{product}:** {len(pages)} labels"
-            )
-
-        if uncategorized:
-
-            st.warning(
-                f"{len(uncategorized)} label(s) could not "
-                "be matched with your SKU mappings."
-            )
-
-
-# ============================================================
-# INVENTORY PAGE
-# ============================================================
-
-def show_inventory():
-
-    st.title("📦 Inventory Management")
-
-    inventory = get_inventory()
-
-    if not inventory:
-
-        st.info(
-            "No products available. Add Master Products first."
-        )
-
-        return
-
-    for product in inventory:
-
-        name = (
-            product.get("name")
-            or product.get("master_product_name")
-            or "Unnamed Product"
-        )
-
-        product_id = product["id"]
-
-        current_quantity = int(
-            product.get("quantity", 0) or 0
-        )
-
-        minimum_stock = int(
-            product.get("minimum_stock", 0) or 0
-        )
-
-        with st.expander(
-            f"📦 {name}",
-            expanded=False
-        ):
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                new_quantity = st.number_input(
-                    "Current Quantity",
-                    min_value=0,
-                    value=current_quantity,
-                    step=1,
-                    key=f"quantity_{product_id}"
-                )
-
-            with col2:
-
-                new_minimum = st.number_input(
-                    "Minimum Stock Limit",
-                    min_value=0,
-                    value=minimum_stock,
-                    step=1,
-                    key=f"minimum_{product_id}"
-                )
-
-            if st.button(
-                "Save Changes",
-                key=f"save_{product_id}"
-            ):
-
-                try:
-
-                    supabase.table(
-                        "master_products"
-                    ).update({
-                        "quantity": int(new_quantity),
-                        "minimum_stock": int(new_minimum)
-                    }).eq(
-                        "id",
-                        product_id
-                    ).execute()
-
-                    st.success(
-                        "Inventory updated successfully!"
-                    )
-
-                    st.rerun()
-
-                except Exception as e:
-
-                    st.error(
-                        f"Could not update inventory: {e}"
-                    )
-
-
-# ============================================================
-# MAIN APP
-# ============================================================
-
-def show_main_app():
-
-    profile = st.session_state.profile
-
-    company_name = (
-        profile.get("company_name", "Meesho Label Organizer")
-        if profile
-        else "Meesho Label Organizer"
+    st.info(
+        "Your current subscription information "
+        "will appear here."
     )
+
+    st.subheader("Current Plan")
+
+    st.write(
+        "Plan: Free / Expired"
+    )
+
+    st.caption(
+        "Subscription functionality can be "
+        "connected to your payments table."
+    )
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+def show_sidebar():
 
     with st.sidebar:
 
         st.title("📦 Meesho Organizer")
 
-        st.caption(company_name)
+        st.caption(
+            get_company_name()
+        )
 
         st.divider()
 
@@ -1863,74 +1208,99 @@ def show_main_app():
             "Subscription"
         ]
 
-        for page in pages:
-
-            if st.button(
-                page,
-                use_container_width=True
-            ):
-
-                st.session_state.current_page = page
-                st.rerun()
+        selected_page = st.radio(
+            "Navigation",
+            pages,
+            label_visibility="collapsed"
+        )
 
         st.divider()
 
-        subscription = get_subscription_status()
-
-        st.caption(
-            f"Current Plan: {subscription['plan']}"
-        )
+        st.caption("Current Plan: Free")
 
         if st.button(
             "🚪 Logout",
             use_container_width=True
         ):
 
-            logout()
+            logout_user()
 
-    page = st.session_state.current_page
+    return selected_page
 
+
+# =========================================================
+# MAIN APPLICATION
+# =========================================================
+
+def main():
+
+    # Check Supabase configuration
+    if supabase is None:
+
+        st.title("📦 Meesho Label Organizer")
+
+        st.error(
+            "Supabase configuration is missing."
+        )
+
+        st.info(
+            "Add your SUPABASE_URL and SUPABASE_KEY "
+            "to Streamlit Secrets."
+        )
+
+        st.code(
+            '''
+SUPABASE_URL = "your-supabase-url"
+SUPABASE_KEY = "your-supabase-anon-key"
+            '''
+        )
+
+        return
+
+    # Check authentication
+    if not st.session_state.user:
+
+        show_login_page()
+
+        return
+
+    # Load profile if necessary
+    if not st.session_state.profile:
+
+        load_user_profile()
+
+    # Sidebar navigation
+    page = show_sidebar()
+
+    # Route pages
     if page == "Dashboard":
+
         show_dashboard()
 
     elif page == "PDF Organizer":
+
         show_pdf_organizer()
 
     elif page == "Master Products":
+
         show_master_products()
 
     elif page == "SKU Mappings":
+
         show_sku_mappings()
 
     elif page == "Inventory":
+
         show_inventory()
 
     elif page == "Subscription":
-        show_subscription_page()
+
+        show_subscription()
 
 
-# ============================================================
-# APPLICATION START
-# ============================================================
+# =========================================================
+# RUN APPLICATION
+# =========================================================
 
-# Protected application route: unauthenticated users can only see the
-# Login/Register screen. A valid Supabase session is required for every
-# dashboard page.
-if st.session_state.user is None:
-    show_auth_page()
-else:
-    if st.session_state.profile is None:
-        refresh_profile()
-
-    if st.session_state.profile is None:
-        st.error(
-            "Your account is authenticated, but your company profile could not "
-            "be loaded. Please contact the administrator or check the Supabase "
-            "profile trigger setup."
-        )
-
-        if st.button("🚪 Logout", key="missing_profile_logout"):
-            logout()
-    else:
-        show_main_app()
-
+if __name__ == "__main__":
+    main()
