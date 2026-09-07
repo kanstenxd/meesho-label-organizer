@@ -5,6 +5,7 @@ import pandas as pd
 import re
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
+import time
 import extra_streamlit_components as stx
 
 st.set_page_config(
@@ -65,6 +66,8 @@ DEFAULT_SESSION_STATE = {
     "current_page": "Dashboard",
     "batch_results": None,
     "auth_restored": False,
+    "auth_restore_attempts": 0,
+    "auth_restore_pending": False,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -165,55 +168,109 @@ def get_response_user(response):
     return None
 
 
-def restore_login_from_cookie():
-    """Restore Supabase authentication after page refresh."""
-    if st.session_state.user is not None:
-        return True
-
-    if st.session_state.auth_restored:
-        return False
-
-    st.session_state.auth_restored = True
-
+def _get_cookie_tokens():
+    """Read authentication tokens from the browser cookie component safely."""
     try:
         cookies = cookie_manager.get_all()
-        access_token = cookies.get(COOKIE_ACCESS)
-        refresh_token = cookies.get(COOKIE_REFRESH)
+        if not isinstance(cookies, dict):
+            return None, None
+        return (
+            cookies.get(COOKIE_ACCESS),
+            cookies.get(COOKIE_REFRESH),
+        )
+    except Exception:
+        return None, None
 
-        if not access_token or not refresh_token:
-            return False
+
+def _get_response_session(response):
+    try:
+        if hasattr(response, "session") and response.session:
+            return response.session
+    except Exception:
+        pass
+
+    try:
+        if hasattr(response, "data") and getattr(response.data, "session", None):
+            return response.data.session
+    except Exception:
+        pass
+
+    return None
+
+
+def restore_login_from_cookie():
+    """Restore authentication after refresh without deleting browser cookies.
+
+    CookieManager is a browser component and can return an empty value during
+    its first Streamlit render.  Therefore an empty read is retried a few
+    times instead of immediately treating the user as logged out.
+    """
+    if st.session_state.user is not None:
+        st.session_state.auth_restored = True
+        st.session_state.auth_restore_pending = False
+        return True
+
+    access_token, refresh_token = _get_cookie_tokens()
+
+    if not access_token or not refresh_token:
+        attempts = st.session_state.get("auth_restore_attempts", 0)
+
+        # Give the browser component a short opportunity to finish loading.
+        if attempts < 3:
+            st.session_state.auth_restore_attempts = attempts + 1
+            st.session_state.auth_restore_pending = True
+            return None
+
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restored = True
+        return False
+
+    try:
+        session = None
 
         try:
-            supabase.auth.set_session(access_token, refresh_token)
+            response = supabase.auth.set_session(
+                access_token,
+                refresh_token,
+            )
+            session = _get_response_session(response)
         except Exception:
-            refreshed = supabase.auth.refresh_session(refresh_token)
-            session = getattr(refreshed, "session", None)
+            # If the access token has expired, try the refresh token before
+            # giving up.  Do not delete cookies here; only logout() does that.
+            try:
+                refreshed = supabase.auth.refresh_session(refresh_token)
+                session = _get_response_session(refreshed)
+            except Exception:
+                session = None
 
-            if not session:
-                session = getattr(
-                    getattr(refreshed, "data", None),
-                    "session",
-                    None,
-                )
-
-            if not session:
-                clear_auth_cookies()
-                return False
-
-            save_auth_session(session)
+        if session:
+            # A refreshed session can contain new tokens, so persist them.
+            try:
+                save_auth_session(session)
+            except Exception:
+                pass
 
         response = supabase.auth.get_user()
         user = get_response_user(response)
 
-        if not user:
-            clear_auth_cookies()
-            return False
+        if user:
+            st.session_state.user = user
+            st.session_state.auth_restored = True
+            st.session_state.auth_restore_attempts = 0
+            st.session_state.auth_restore_pending = False
+            return True
 
-        st.session_state.user = user
-        return True
+        # Authentication could not be restored, but never erase the browser
+        # session automatically.  The user may retry by refreshing, while an
+        # explicit Logout button remains the only place that clears cookies.
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restored = True
+        return False
 
     except Exception:
-        clear_auth_cookies()
+        # Network/component failures must not silently log the user out.
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restored = True
         return False
 
 
@@ -509,6 +566,8 @@ def logout():
     st.session_state.batch_results = None
     st.session_state.current_page = "Dashboard"
     st.session_state.auth_restored = False
+    st.session_state.auth_restore_attempts = 0
+    st.session_state.auth_restore_pending = False
 
     st.rerun()
 
@@ -591,13 +650,18 @@ def delete_master_product(product_id, product_name):
     company_id = get_company_id()
 
     try:
-        (
-            supabase.table("sku_mappings")
-            .delete()
-            .eq("company_id", company_id)
-            .eq("master_product_name", product_name)
-            .execute()
-        )
+        master_column = _get_sku_mapping_master_column()
+        if master_column:
+            delete_value = product_name
+            if master_column == "master_product_id":
+                delete_value = product_id
+            (
+                supabase.table("sku_mappings")
+                .delete()
+                .eq("company_id", company_id)
+                .eq(master_column, delete_value)
+                .execute()
+            )
     except Exception:
         pass
 
@@ -688,18 +752,11 @@ def update_inventory(product_id, new_quantity, reason=None):
 # ============================================================
 
 def _get_sku_mapping_sku_column():
-    """
-    Resolve the SKU text column used by the existing sku_mappings table.
-
-    Older database versions of this app used different names for the SKU
-    column. The current app must not assume a column named simply ``sku``.
-    """
+    """Resolve the SKU text column used by the installed sku_mappings table."""
     cached = st.session_state.get("sku_mapping_sku_column")
     if cached:
         return cached
 
-    # ``sku_name`` is the schema used by the current project database.
-    # The remaining names keep the app compatible with older installations.
     candidates = [
         "sku_name",
         "sku",
@@ -710,46 +767,104 @@ def _get_sku_mapping_sku_column():
     ]
 
     company_id = get_company_id()
-
     for column in candidates:
         try:
-            query = supabase.table("sku_mappings").select(
-                f"id,{column}"
-            ).limit(1)
-
+            query = supabase.table("sku_mappings").select(f"id,{column}").limit(1)
             if company_id:
                 query = query.eq("company_id", company_id)
-
             query.execute()
             st.session_state.sku_mapping_sku_column = column
             return column
         except Exception:
-            # Try the next possible schema column without displaying a
-            # database error to the user.
             continue
-
     return None
 
 
-def _normalize_mapping_row(row, sku_column=None):
-    """Return a mapping row with a consistent ``sku`` key for the app."""
+def _get_sku_mapping_master_column():
+    """Resolve the master-product column without assuming one fixed schema.
+
+    Different versions of this project have used different column names.  The
+    app therefore detects the column that actually exists before reading or
+    writing a mapping.  This specifically prevents the PostgREST PGRST204
+    error caused by hard-coding ``master_product_name``.
+    """
+    cached = st.session_state.get("sku_mapping_master_column")
+    if cached:
+        return cached
+
+    candidates = [
+        "master_product_name",
+        "master_product",
+        "master_product_id",
+        "product_name",
+        "mapped_product",
+        "master_name",
+        "category",
+    ]
+
+    company_id = get_company_id()
+    for column in candidates:
+        try:
+            query = supabase.table("sku_mappings").select(f"id,{column}").limit(1)
+            if company_id:
+                query = query.eq("company_id", company_id)
+            query.execute()
+            st.session_state.sku_mapping_master_column = column
+            return column
+        except Exception:
+            continue
+    return None
+
+
+def _master_product_value_for_storage(master_column, master_product_name):
+    """Convert a product name to an ID when the installed schema stores IDs."""
+    if master_column != "master_product_id":
+        return master_product_name
+
+    target = normalize_text(master_product_name)
+    for product in get_inventory():
+        if normalize_text(product.get("product_name", "")) == target:
+            return product.get("id")
+    return None
+
+
+def _master_product_name_from_value(master_column, value):
+    """Convert a stored master-product ID back to a display name when needed."""
+    if master_column != "master_product_id":
+        return value
+    if value in (None, ""):
+        return ""
+    value = str(value)
+    for product in get_inventory():
+        if str(product.get("id")) == value:
+            return product.get("product_name", "")
+    return value
+
+def _normalize_mapping_row(row, sku_column=None, master_column=None):
+    """Return a mapping row with consistent ``sku`` and master-product keys."""
     item = dict(row or {})
     sku_column = sku_column or _get_sku_mapping_sku_column()
+    master_column = master_column or _get_sku_mapping_master_column()
 
     if "sku" not in item or item.get("sku") in (None, ""):
         if sku_column and sku_column in item:
             item["sku"] = item.get(sku_column)
-
         if not item.get("sku"):
-            for column in (
-                "sku_name",
-                "product_sku",
-                "sku_text",
-                "label_sku",
-                "mapped_sku",
-            ):
+            for column in ("sku_name", "product_sku", "sku_text", "label_sku", "mapped_sku"):
                 if item.get(column):
                     item["sku"] = item.get(column)
+                    break
+
+    if not item.get("master_product_name"):
+        if master_column and master_column in item:
+            item["master_product_name"] = _master_product_name_from_value(
+                master_column,
+                item.get(master_column),
+            )
+        if not item.get("master_product_name"):
+            for column in ("master_product", "product_name", "mapped_product", "master_name", "category"):
+                if item.get(column):
+                    item["master_product_name"] = item.get(column)
                     break
 
     return item
@@ -757,24 +872,14 @@ def _normalize_mapping_row(row, sku_column=None):
 
 def get_user_mappings():
     company_id = get_company_id()
-
     if not company_id:
         return []
 
     try:
-        response = (
-            supabase.table("sku_mappings")
-            .select("*")
-            .eq("company_id", company_id)
-            .execute()
-        )
-
+        response = supabase.table("sku_mappings").select("*").eq("company_id", company_id).execute()
         sku_column = _get_sku_mapping_sku_column()
-        return [
-            _normalize_mapping_row(row, sku_column)
-            for row in (response.data or [])
-        ]
-
+        master_column = _get_sku_mapping_master_column()
+        return [_normalize_mapping_row(row, sku_column, master_column) for row in (response.data or [])]
     except Exception as e:
         st.error(f"Could not load SKU mappings: {e}")
         return []
@@ -783,22 +888,36 @@ def get_user_mappings():
 def save_sku_mapping(sku, master_product_name):
     sku = str(sku or "").strip()
     master_product_name = str(master_product_name or "").strip()
-
     if not sku or not master_product_name:
         return False
 
     company_id = get_company_id()
-
     if not company_id:
         st.error("Could not save SKU mapping: company information is missing.")
         return False
 
     sku_column = _get_sku_mapping_sku_column()
-
-    if not sku_column:
+    master_column = _get_sku_mapping_master_column()
+    if not sku_column or not master_column:
+        missing = []
+        if not sku_column:
+            missing.append("SKU")
+        if not master_column:
+            missing.append("Master Product")
         st.error(
-            "Could not save SKU mapping because no supported SKU column "
-            "was found in the sku_mappings table."
+            "Could not save SKU mapping because the sku_mappings table does not "
+            f"contain a supported {' and '.join(missing)} column."
+        )
+        return False
+
+    master_value = _master_product_value_for_storage(
+        master_column,
+        master_product_name,
+    )
+    if master_value in (None, ""):
+        st.error(
+            "Could not save SKU mapping because the selected Master Product "
+            "could not be resolved in the current database schema."
         )
         return False
 
@@ -813,15 +932,7 @@ def save_sku_mapping(sku, master_product_name):
         )
 
         if existing.data:
-            update_data = {
-                "master_product_name": master_product_name,
-            }
-
-            # Keep user_id updated when that optional column exists.
-            user_id = get_current_user_id()
-            if user_id:
-                update_data["user_id"] = user_id
-
+            update_data = {master_column: master_value}
             (
                 supabase.table("sku_mappings")
                 .update(update_data)
@@ -831,24 +942,23 @@ def save_sku_mapping(sku, master_product_name):
         else:
             insert_data = {
                 "company_id": company_id,
-                "master_product_name": master_product_name,
                 sku_column: sku,
+                master_column: master_value,
             }
-
-            # Some older schemas do not contain user_id, so first try the
-            # minimal compatible insert.
             (
                 supabase.table("sku_mappings")
                 .insert(insert_data)
                 .execute()
             )
-
         return True
-
     except Exception as e:
+        # A Supabase schema cache can be stale immediately after a migration.
+        # Forget detected column names so a later rerun can detect the schema
+        # again instead of repeatedly using a stale name.
+        st.session_state.pop("sku_mapping_sku_column", None)
+        st.session_state.pop("sku_mapping_master_column", None)
         st.error(f"Could not save SKU mapping: {e}")
         return False
-
 
 def delete_sku_mapping(mapping_id):
     try:
@@ -1133,11 +1243,15 @@ def find_matching_master_product(
     """
     Matching order:
 
-    1. Exact saved SKU mapping -> assign immediately.
-    2. Exact two-word-or-longer Master Product phrase inside the SKU ->
-       assign immediately. Case, underscores and hyphens are ignored.
-    3. Similar spelling -> DO NOT assign automatically. Return the best
-       suggestions so the user can choose a Master Product or create a new one.
+    1. A previously saved SKU mapping -> assign immediately. This is the only
+       situation where the app assigns a SKU without asking again.
+    2. For a SKU seen for the first time, never assign it automatically, even
+       when an exact Master Product phrase appears in the SKU. Instead, show
+       the best possible Master Product suggestions and wait for the user's
+       decision.
+    3. Once the user explicitly assigns a SKU to a Master Product, that exact
+       normalized SKU mapping is saved and will be reused automatically in
+       future uploads. Matching ignores case, underscores and hyphens.
     """
     sku = str(extracted.get("sku", "") or "").strip()
     sku_norm = normalize_text(sku)
@@ -1163,6 +1277,10 @@ def find_matching_master_product(
             )
 
     # Priority 2: exact Master Product phrase inside the SKU.
+    # IMPORTANT: an exact phrase match is only a suggestion for a SKU that has
+    # never been manually mapped before. The user must approve it the first
+    # time. After approval, Priority 1 above remembers the mapping and future
+    # occurrences are assigned automatically.
     exact_phrase_matches = []
 
     for product in master_products:
@@ -1175,7 +1293,6 @@ def find_matching_master_product(
             exact_phrase_matches.append(name)
 
     if exact_phrase_matches:
-        # Prefer the most specific/longest Master Product name.
         exact_phrase_matches.sort(
             key=lambda value: len(
                 normalize_text(value).split()
@@ -1183,17 +1300,42 @@ def find_matching_master_product(
             reverse=True,
         )
 
+        candidates = [
+            {"name": name, "score": 1.0}
+            for name in exact_phrase_matches
+        ]
+
+        # Add other possible similar Master Products after the exact matches so
+        # the user can still choose a different product if necessary.
+        existing = {
+            normalize_text(candidate["name"])
+            for candidate in candidates
+        }
+        for candidate in get_ranked_master_product_candidates(
+            sku,
+            master_products,
+            minimum_score=0.0,
+        ):
+            if (
+                normalize_text(candidate["name"])
+                not in existing
+            ):
+                candidates.append(candidate)
+
         return (
-            exact_phrase_matches[0],
-            "Automatic exact name match",
+            None,
+            "Review required: exact Master Product phrase found",
             1.0,
-            [],
+            candidates[:5],
         )
 
-    # Priority 3: similar matches require user confirmation.
+    # Priority 3: similar or otherwise unmatched first-time SKUs also require
+    # user confirmation. Return the best available choices; never assign one
+    # automatically until the user has explicitly approved a mapping.
     candidates = get_ranked_master_product_candidates(
         sku,
         master_products,
+        minimum_score=0.0,
     )
 
     if candidates:
@@ -1202,7 +1344,7 @@ def find_matching_master_product(
         return (
             None,
             (
-                "Review suggested match: "
+                "Review required: suggested match "
                 f"{best['name']} ({best['score']:.0%})"
             ),
             best["score"],
@@ -1211,7 +1353,7 @@ def find_matching_master_product(
 
     return (
         None,
-        "No confident match",
+        "No Master Products available for review",
         0.0,
         [],
     )
@@ -1303,35 +1445,10 @@ def reorganize_pdfs(uploaded_files):
                     }
                 )
 
-                # Only exact rules are automatically remembered.
-                # Similarity suggestions are intentionally NOT saved until the
-                # user explicitly chooses a Master Product.
-                if (
-                    master_product
-                    and sku_key
-                    and sku_key not in known_skus
-                    and match_method in {
-                        "Automatic exact name match",
-                    }
-                ):
-                    if save_sku_mapping(
-                        details["sku"],
-                        master_product,
-                    ):
-                        known_skus.add(sku_key)
-                        mappings.append(
-                            {
-                                "sku": details["sku"],
-                                "master_product_name": master_product,
-                            }
-                        )
-                        auto_mappings.append(
-                            {
-                                "SKU": details["sku"],
-                                "Master Product": master_product,
-                                "Match Method": match_method,
-                            }
-                        )
+                # Never create a new mapping automatically for a first-time
+                # SKU. A mapping is persisted only after the user explicitly
+                # assigns the SKU on the review screen or in SKU Mappings.
+                # Existing saved mappings are still reused automatically.
 
                 # Keep one review item per unique extracted SKU.
                 if (
@@ -1883,24 +2000,21 @@ def show_master_products():
             if response is not None:
                 if edited_name.strip() != str(old_name).strip():
                     try:
-                        (
-                            supabase.table("sku_mappings")
-                            .update(
-                                {
-                                    "master_product_name":
-                                        edited_name.strip()
-                                }
+                        master_column = _get_sku_mapping_master_column()
+                        if master_column:
+                            if master_column == "master_product_id":
+                                old_value = selected_product.get("id")
+                                new_value = selected_product.get("id")
+                            else:
+                                old_value = old_name
+                                new_value = edited_name.strip()
+                            (
+                                supabase.table("sku_mappings")
+                                .update({master_column: new_value})
+                                .eq("company_id", get_company_id())
+                                .eq(master_column, old_value)
+                                .execute()
                             )
-                            .eq(
-                                "company_id",
-                                get_company_id(),
-                            )
-                            .eq(
-                                "master_product_name",
-                                old_name,
-                            )
-                            .execute()
-                        )
                     except Exception:
                         pass
 
@@ -2012,8 +2126,9 @@ def show_sku_mappings():
 
     if not mappings:
         st.info(
-            "No mappings exist yet. High-confidence PDF matches "
-            "will also be saved automatically."
+            "No mappings exist yet. First-time SKU matches will always ask for "
+            "your confirmation. After you save a mapping, that same SKU will "
+            "be remembered and assigned automatically in future uploads."
         )
         return
 
@@ -2236,9 +2351,11 @@ def show_pdf_organizer():
         st.divider()
         st.subheader("🔍 Review Similar SKU Matches")
         st.info(
-            "Similar spellings are never assigned automatically. "
-            "For each SKU below, choose one of the suggested Master Products "
-            "or create a new Master Product and assign the SKU to it."
+            "Every SKU that has not been assigned by you previously requires "
+            "your confirmation. The app will suggest the best possible Master "
+            "Products, but it will not assign a first-time SKU automatically. "
+            "Once you assign it, the mapping is remembered and the same SKU "
+            "will be assigned automatically in future uploads."
         )
 
         for review_key, review in list(
@@ -2768,7 +2885,14 @@ def show_main_app():
 # ============================================================
 
 if st.session_state.user is None:
-    restore_login_from_cookie()
+    restored = restore_login_from_cookie()
+
+    # Cookie components can become available a moment after the first script
+    # run.  Retry briefly so a normal browser refresh does not show the login
+    # page and make the user appear logged out.
+    if restored is None and st.session_state.get("auth_restore_pending"):
+        time.sleep(0.2)
+        st.rerun()
 
 if st.session_state.user is None:
     show_auth_page()
