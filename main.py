@@ -687,6 +687,74 @@ def update_inventory(product_id, new_quantity, reason=None):
 # SKU MAPPINGS
 # ============================================================
 
+def _get_sku_mapping_sku_column():
+    """
+    Resolve the SKU text column used by the existing sku_mappings table.
+
+    Older database versions of this app used different names for the SKU
+    column. The current app must not assume a column named simply ``sku``.
+    """
+    cached = st.session_state.get("sku_mapping_sku_column")
+    if cached:
+        return cached
+
+    # ``sku_name`` is the schema used by the current project database.
+    # The remaining names keep the app compatible with older installations.
+    candidates = [
+        "sku_name",
+        "sku",
+        "product_sku",
+        "sku_text",
+        "label_sku",
+        "mapped_sku",
+    ]
+
+    company_id = get_company_id()
+
+    for column in candidates:
+        try:
+            query = supabase.table("sku_mappings").select(
+                f"id,{column}"
+            ).limit(1)
+
+            if company_id:
+                query = query.eq("company_id", company_id)
+
+            query.execute()
+            st.session_state.sku_mapping_sku_column = column
+            return column
+        except Exception:
+            # Try the next possible schema column without displaying a
+            # database error to the user.
+            continue
+
+    return None
+
+
+def _normalize_mapping_row(row, sku_column=None):
+    """Return a mapping row with a consistent ``sku`` key for the app."""
+    item = dict(row or {})
+    sku_column = sku_column or _get_sku_mapping_sku_column()
+
+    if "sku" not in item or item.get("sku") in (None, ""):
+        if sku_column and sku_column in item:
+            item["sku"] = item.get(sku_column)
+
+        if not item.get("sku"):
+            for column in (
+                "sku_name",
+                "product_sku",
+                "sku_text",
+                "label_sku",
+                "mapped_sku",
+            ):
+                if item.get(column):
+                    item["sku"] = item.get(column)
+                    break
+
+    return item
+
+
 def get_user_mappings():
     company_id = get_company_id()
 
@@ -700,7 +768,13 @@ def get_user_mappings():
             .eq("company_id", company_id)
             .execute()
         )
-        return response.data or []
+
+        sku_column = _get_sku_mapping_sku_column()
+        return [
+            _normalize_mapping_row(row, sku_column)
+            for row in (response.data or [])
+        ]
+
     except Exception as e:
         st.error(f"Could not load SKU mappings: {e}")
         return []
@@ -715,39 +789,57 @@ def save_sku_mapping(sku, master_product_name):
 
     company_id = get_company_id()
 
+    if not company_id:
+        st.error("Could not save SKU mapping: company information is missing.")
+        return False
+
+    sku_column = _get_sku_mapping_sku_column()
+
+    if not sku_column:
+        st.error(
+            "Could not save SKU mapping because no supported SKU column "
+            "was found in the sku_mappings table."
+        )
+        return False
+
     try:
         existing = (
             supabase.table("sku_mappings")
             .select("id")
             .eq("company_id", company_id)
-            .eq("sku", sku)
+            .eq(sku_column, sku)
             .limit(1)
             .execute()
         )
 
         if existing.data:
+            update_data = {
+                "master_product_name": master_product_name,
+            }
+
+            # Keep user_id updated when that optional column exists.
+            user_id = get_current_user_id()
+            if user_id:
+                update_data["user_id"] = user_id
+
             (
                 supabase.table("sku_mappings")
-                .update(
-                    {
-                        "master_product_name": master_product_name,
-                        "user_id": get_current_user_id(),
-                    }
-                )
+                .update(update_data)
                 .eq("id", existing.data[0]["id"])
                 .execute()
             )
         else:
+            insert_data = {
+                "company_id": company_id,
+                "master_product_name": master_product_name,
+                sku_column: sku,
+            }
+
+            # Some older schemas do not contain user_id, so first try the
+            # minimal compatible insert.
             (
                 supabase.table("sku_mappings")
-                .insert(
-                    {
-                        "company_id": company_id,
-                        "user_id": get_current_user_id(),
-                        "master_product_name": master_product_name,
-                        "sku": sku,
-                    }
-                )
+                .insert(insert_data)
                 .execute()
             )
 
