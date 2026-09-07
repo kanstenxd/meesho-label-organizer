@@ -31,7 +31,6 @@ COOKIE_EXPIRY_DAYS = 30
 # SUPABASE + COOKIE CONNECTIONS
 # ============================================================
 
-@st.cache_resource
 def get_supabase():
     try:
         return create_client(
@@ -47,10 +46,9 @@ def get_supabase():
 
 
 def get_cookie_manager():
-    # Do not cache Streamlit custom components.
-    # CookieManager creates a Streamlit widget and caching it causes
-    # CachedWidgetWarning and can interfere with component rendering.
-    return stx.CookieManager()
+    # Keep one stable component identity across reruns. CookieManager loads
+    # browser cookies asynchronously after a Streamlit page refresh.
+    return stx.CookieManager(key="meesho_auth_cookie_manager")
 
 
 supabase: Client = get_supabase()
@@ -71,6 +69,8 @@ DEFAULT_SESSION_STATE = {
     "auth_restore_pending": False,
     "auth_restore_started_at": None,
     "auth_cookie_seen": False,
+    "auth_component_ready": False,
+    "auth_restore_generation": 0,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -183,19 +183,24 @@ def get_response_user(response):
 
 
 def _get_cookie_auth():
-    """Read authentication cookies without assuming the component is ready."""
+    """Read authentication cookies without mistaking component startup for logout."""
     try:
         cookies = cookie_manager.get_all()
+        if cookies is None:
+            return None, None, None, False, False
         if not isinstance(cookies, dict):
-            return None, None, None, False
+            return None, None, None, False, False
 
+        # CookieManager returns an empty dict while its frontend component is
+        # still starting on some Streamlit refreshes. Do not treat that as a
+        # confirmed logout.
         access_token = cookies.get(COOKIE_ACCESS)
         refresh_token = cookies.get(COOKIE_REFRESH)
         marker = cookies.get(COOKIE_LOGIN_MARKER)
         has_any_auth_cookie = bool(access_token or refresh_token or marker)
-        return access_token, refresh_token, marker, has_any_auth_cookie
+        return access_token, refresh_token, marker, has_any_auth_cookie, True
     except Exception:
-        return None, None, None, False
+        return None, None, None, False, False
 
 
 def _get_response_session(response):
@@ -204,105 +209,106 @@ def _get_response_session(response):
             return response.session
     except Exception:
         pass
-
     try:
         if hasattr(response, "data") and getattr(response.data, "session", None):
             return response.data.session
     except Exception:
         pass
-
     return None
 
 
 def restore_login_from_cookie():
-    """Restore login after refresh without ever clearing cookies automatically.
+    """Restore authentication after refresh.
 
-    CookieManager is asynchronous. A browser refresh creates a fresh Streamlit
-    session, and the component may need several reruns before returning its
-    cookies. Therefore the app waits for authentication cookies instead of
-    immediately displaying the login page and making the user appear logged out.
+    IMPORTANT: Nothing in this function logs a user out or deletes cookies.
+    A fresh Streamlit session is created on browser refresh, so the app waits
+    for CookieManager to become available before deciding whether to show the
+    login screen.
     """
     if st.session_state.get("user") is not None:
         st.session_state.auth_restored = True
         st.session_state.auth_restore_pending = False
-        st.session_state.auth_restore_started_at = None
         return True
 
-    access_token, refresh_token, marker, has_auth_cookie = _get_cookie_auth()
+    access_token, refresh_token, marker, has_auth_cookie, component_ready = _get_cookie_auth()
+
+    # The custom component may need multiple reruns after a hard refresh.
+    if not component_ready:
+        st.session_state.auth_restore_pending = True
+        return None
+
+    st.session_state.auth_component_ready = True
 
     if has_auth_cookie:
         st.session_state.auth_cookie_seen = True
 
+    # If no auth cookies are currently visible, wait for a short initialization
+    # window before treating this as a genuinely logged-out visitor. This avoids
+    # the common refresh race where get_all() initially returns {}.
     if not access_token or not refresh_token:
-        # If cookies have not appeared yet, keep waiting. Once we have seen an
-        # auth cookie during this browser session, keep the app in restore mode
-        # instead of silently sending the user back to the login screen.
-        attempts = int(st.session_state.get("auth_restore_attempts", 0) or 0)
         started = st.session_state.get("auth_restore_started_at")
         if started is None:
             started = time.time()
             st.session_state.auth_restore_started_at = started
 
         elapsed = time.time() - float(started)
-        seen_login = bool(st.session_state.get("auth_cookie_seen"))
-
-        # A new visitor should not be delayed for long. A returning visitor is
-        # given a generous grace period because CookieManager can initialize
-        # slowly after a Streamlit refresh/reconnect.
-        wait_seconds = 10.0 if seen_login else 1.5
-
-        if elapsed < wait_seconds:
-            st.session_state.auth_restore_attempts = attempts + 1
+        if elapsed < 8.0:
+            st.session_state.auth_restore_attempts = int(st.session_state.get("auth_restore_attempts", 0)) + 1
             st.session_state.auth_restore_pending = True
             return None
 
+        # We only reach False after CookieManager has had time to initialize.
+        # No cookies are deleted here.
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
 
+    # Both tokens are present. Restore the exact Supabase session first.
+    session = None
     try:
+        response = supabase.auth.set_session(access_token, refresh_token)
+        session = _get_response_session(response)
+    except Exception:
         session = None
 
-        # set_session is the normal restoration path.
+    # Supabase versions differ in refresh_session's signature. Try both forms.
+    if not session:
         try:
-            response = supabase.auth.set_session(access_token, refresh_token)
+            response = supabase.auth.refresh_session()
             session = _get_response_session(response)
+        except TypeError:
+            try:
+                response = supabase.auth.refresh_session(refresh_token)
+                session = _get_response_session(response)
+            except Exception:
+                session = None
         except Exception:
             session = None
 
-        # If the access token is stale, use the refresh token to obtain a new
-        # session. The old cookies are deliberately NOT deleted on failure.
-        if not session:
-            try:
-                refreshed = supabase.auth.refresh_session(refresh_token)
-                session = _get_response_session(refreshed)
-            except Exception:
-                session = None
-
-        if session:
+    if session:
+        try:
             save_auth_session(session)
+        except Exception:
+            pass
 
+    try:
         response = supabase.auth.get_user()
         user = get_response_user(response)
-
-        if user:
-            st.session_state.user = user
-            st.session_state.auth_restored = True
-            st.session_state.auth_restore_attempts = 0
-            st.session_state.auth_restore_pending = False
-            st.session_state.auth_restore_started_at = None
-            return True
-
-        # Do not clear cookies or force a logout here. Keep the restore process
-        # alive for a returning user so temporary Supabase/network failures do
-        # not turn into an unnecessary logout.
-        st.session_state.auth_restore_pending = True
-        return None
-
     except Exception:
-        # Temporary failures must never clear a valid browser login.
-        st.session_state.auth_restore_pending = True
-        return None
+        user = None
+
+    if user:
+        st.session_state.user = user
+        st.session_state.auth_restored = True
+        st.session_state.auth_restore_attempts = 0
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restore_started_at = None
+        return True
+
+    # A transient Supabase failure must never be converted into a logout.
+    # Keep attempting restoration while the browser tokens remain present.
+    st.session_state.auth_restore_pending = True
+    return None
 
 
 # ============================================================
@@ -608,6 +614,8 @@ def logout():
     st.session_state.auth_restore_pending = False
     st.session_state.auth_restore_started_at = None
     st.session_state.auth_cookie_seen = False
+    st.session_state.auth_component_ready = False
+    st.session_state.auth_restore_generation = int(st.session_state.get("auth_restore_generation", 0)) + 1
 
     st.rerun()
 
@@ -2963,11 +2971,12 @@ def show_main_app():
 if st.session_state.user is None:
     restored = restore_login_from_cookie()
 
-    if restored is None and st.session_state.get("auth_restore_pending"):
-        # Stay on the restoration path instead of dropping the user onto the
-        # login page during a normal refresh or temporary network delay.
+    if restored is None:
+        # CookieManager and Supabase can initialize asynchronously after a
+        # browser refresh. Keep the user on a restoration screen instead of
+        # incorrectly sending them back to Login.
         st.info("Restoring your login session…")
-        time.sleep(0.35)
+        time.sleep(0.4)
         st.rerun()
 
 if st.session_state.user is None:
