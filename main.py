@@ -5,7 +5,6 @@ import pandas as pd
 import re
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
-import time
 import extra_streamlit_components as stx
 
 st.set_page_config(
@@ -23,7 +22,7 @@ ADMIN_EMAILS = {"keyurtank8@gmail.com"}
 
 COOKIE_ACCESS = "meesho_access_token"
 COOKIE_REFRESH = "meesho_refresh_token"
-COOKIE_LOGIN_MARKER = "meesho_login_marker"
+COOKIE_MANAGER_KEY = "meesho_auth_cookie_manager"
 COOKIE_EXPIRY_DAYS = 30
 
 
@@ -31,6 +30,7 @@ COOKIE_EXPIRY_DAYS = 30
 # SUPABASE + COOKIE CONNECTIONS
 # ============================================================
 
+@st.cache_resource
 def get_supabase():
     try:
         return create_client(
@@ -46,9 +46,9 @@ def get_supabase():
 
 
 def get_cookie_manager():
-    # Keep one stable component identity across reruns. CookieManager loads
-    # browser cookies asynchronously after a Streamlit page refresh.
-    return stx.CookieManager(key="meesho_auth_cookie_manager")
+    # CookieManager is a Streamlit component. Give it one stable key so the
+    # browser component keeps the same identity across normal reruns/refreshes.
+    return stx.CookieManager(key=COOKIE_MANAGER_KEY)
 
 
 supabase: Client = get_supabase()
@@ -67,10 +67,6 @@ DEFAULT_SESSION_STATE = {
     "auth_restored": False,
     "auth_restore_attempts": 0,
     "auth_restore_pending": False,
-    "auth_restore_started_at": None,
-    "auth_cookie_seen": False,
-    "auth_component_ready": False,
-    "auth_restore_generation": 0,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -128,41 +124,30 @@ def format_datetime(value):
 # ============================================================
 
 def clear_auth_cookies():
-    """Cookies are cleared only by an explicit user logout."""
     try:
         cookie_manager.delete(COOKIE_ACCESS)
         cookie_manager.delete(COOKIE_REFRESH)
-        cookie_manager.delete(COOKIE_LOGIN_MARKER)
     except Exception:
         pass
 
 
 def save_auth_session(session):
-    """Persist the Supabase session in browser cookies."""
     if not session:
         return
 
     try:
         expires_at = now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS)
-        access_token = getattr(session, "access_token", None)
-        refresh_token = getattr(session, "refresh_token", None)
-        user = getattr(session, "user", None)
-
-        if access_token:
-            cookie_manager.set(COOKIE_ACCESS, str(access_token), expires_at=expires_at)
-        if refresh_token:
-            cookie_manager.set(COOKIE_REFRESH, str(refresh_token), expires_at=expires_at)
-
-        # This marker lets the app distinguish a returning user whose browser
-        # cookies are still loading from a genuinely new visitor.
-        if user and getattr(user, "id", None):
-            cookie_manager.set(
-                COOKIE_LOGIN_MARKER,
-                str(user.id),
-                expires_at=expires_at,
-            )
+        cookie_manager.set(
+            COOKIE_ACCESS,
+            str(session.access_token),
+            expires_at=expires_at,
+        )
+        cookie_manager.set(
+            COOKIE_REFRESH,
+            str(session.refresh_token),
+            expires_at=expires_at,
+        )
     except Exception:
-        # Never treat a temporary CookieManager issue as a logout.
         pass
 
 
@@ -182,25 +167,30 @@ def get_response_user(response):
     return None
 
 
-def _get_cookie_auth():
-    """Read authentication cookies without mistaking component startup for logout."""
+def _cookie_manager_ready():
+    """Return True only after the browser CookieManager has finished loading."""
+    try:
+        ready = getattr(cookie_manager, "ready", None)
+        if callable(ready):
+            return bool(ready())
+        # Compatibility fallback for older package versions.
+        return True
+    except Exception:
+        return False
+
+
+def _get_cookie_tokens():
+    """Read authentication tokens only after CookieManager is ready."""
     try:
         cookies = cookie_manager.get_all()
-        if cookies is None:
-            return None, None, None, False, False
         if not isinstance(cookies, dict):
-            return None, None, None, False, False
-
-        # CookieManager returns an empty dict while its frontend component is
-        # still starting on some Streamlit refreshes. Do not treat that as a
-        # confirmed logout.
-        access_token = cookies.get(COOKIE_ACCESS)
-        refresh_token = cookies.get(COOKIE_REFRESH)
-        marker = cookies.get(COOKIE_LOGIN_MARKER)
-        has_any_auth_cookie = bool(access_token or refresh_token or marker)
-        return access_token, refresh_token, marker, has_any_auth_cookie, True
+            return None, None
+        return (
+            cookies.get(COOKIE_ACCESS),
+            cookies.get(COOKIE_REFRESH),
+        )
     except Exception:
-        return None, None, None, False, False
+        return None, None
 
 
 def _get_response_session(response):
@@ -209,106 +199,79 @@ def _get_response_session(response):
             return response.session
     except Exception:
         pass
+
     try:
         if hasattr(response, "data") and getattr(response.data, "session", None):
             return response.data.session
     except Exception:
         pass
+
     return None
 
 
 def restore_login_from_cookie():
-    """Restore authentication after refresh.
+    """Restore the saved Supabase login after a browser refresh.
 
-    IMPORTANT: Nothing in this function logs a user out or deletes cookies.
-    A fresh Streamlit session is created on browser refresh, so the app waits
-    for CookieManager to become available before deciding whether to show the
-    login screen.
+    The crucial rule here is that an unready CookieManager is NOT the same as
+    a missing login. We wait for the component to finish loading and never
+    delete cookies from this function. Cookies are deleted only by logout().
     """
     if st.session_state.get("user") is not None:
         st.session_state.auth_restored = True
         st.session_state.auth_restore_pending = False
         return True
 
-    access_token, refresh_token, marker, has_auth_cookie, component_ready = _get_cookie_auth()
-
-    # The custom component may need multiple reruns after a hard refresh.
-    if not component_ready:
+    # On a hard refresh the component is asynchronous. Do not use forced
+    # rerun/sleep loops here; those loops can continuously restart the component
+    # before it has a chance to return the browser cookies.
+    if not _cookie_manager_ready():
         st.session_state.auth_restore_pending = True
         return None
 
-    st.session_state.auth_component_ready = True
+    access_token, refresh_token = _get_cookie_tokens()
 
-    if has_auth_cookie:
-        st.session_state.auth_cookie_seen = True
-
-    # If no auth cookies are currently visible, wait for a short initialization
-    # window before treating this as a genuinely logged-out visitor. This avoids
-    # the common refresh race where get_all() initially returns {}.
+    # The component is ready and there is genuinely no saved login.
     if not access_token or not refresh_token:
-        started = st.session_state.get("auth_restore_started_at")
-        if started is None:
-            started = time.time()
-            st.session_state.auth_restore_started_at = started
-
-        elapsed = time.time() - float(started)
-        if elapsed < 8.0:
-            st.session_state.auth_restore_attempts = int(st.session_state.get("auth_restore_attempts", 0)) + 1
-            st.session_state.auth_restore_pending = True
-            return None
-
-        # We only reach False after CookieManager has had time to initialize.
-        # No cookies are deleted here.
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
 
-    # Both tokens are present. Restore the exact Supabase session first.
-    session = None
     try:
         response = supabase.auth.set_session(access_token, refresh_token)
         session = _get_response_session(response)
-    except Exception:
-        session = None
-
-    # Supabase versions differ in refresh_session's signature. Try both forms.
-    if not session:
-        try:
-            response = supabase.auth.refresh_session()
-            session = _get_response_session(response)
-        except TypeError:
-            try:
-                response = supabase.auth.refresh_session(refresh_token)
-                session = _get_response_session(response)
-            except Exception:
-                session = None
-        except Exception:
-            session = None
-
-    if session:
-        try:
-            save_auth_session(session)
-        except Exception:
-            pass
-
-    try:
-        response = supabase.auth.get_user()
         user = get_response_user(response)
-    except Exception:
-        user = None
 
-    if user:
-        st.session_state.user = user
-        st.session_state.auth_restored = True
-        st.session_state.auth_restore_attempts = 0
+        if not user and session is not None:
+            user = getattr(session, "user", None)
+
+        if not user:
+            response = supabase.auth.get_user()
+            user = get_response_user(response)
+
+        if user:
+            st.session_state.user = user
+            st.session_state.auth_restored = True
+            st.session_state.auth_restore_pending = False
+            st.session_state.auth_restore_attempts = 0
+
+            # Supabase can rotate tokens while restoring the session.
+            if session:
+                save_auth_session(session)
+
+            return True
+
+        # Do not erase the browser cookies automatically. A real logout is the
+        # only code path allowed to clear them.
         st.session_state.auth_restore_pending = False
-        st.session_state.auth_restore_started_at = None
-        return True
+        st.session_state.auth_restored = True
+        return False
 
-    # A transient Supabase failure must never be converted into a logout.
-    # Keep attempting restoration while the browser tokens remain present.
-    st.session_state.auth_restore_pending = True
-    return None
+    except Exception:
+        # Network/Supabase errors must never trigger an automatic logout or
+        # cookie deletion. Keep the saved browser session intact.
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restored = True
+        return False
 
 
 # ============================================================
@@ -512,13 +475,6 @@ def login_user(email, password):
 
         if session:
             save_auth_session(session)
-        else:
-            # Keep a login marker even if the auth response does not expose
-            # the session object in this client version.
-            try:
-                cookie_manager.set(COOKIE_LOGIN_MARKER, str(user.id), expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS))
-            except Exception:
-                pass
 
         refresh_profile()
         st.success("Login successful!")
@@ -612,10 +568,6 @@ def logout():
     st.session_state.auth_restored = False
     st.session_state.auth_restore_attempts = 0
     st.session_state.auth_restore_pending = False
-    st.session_state.auth_restore_started_at = None
-    st.session_state.auth_cookie_seen = False
-    st.session_state.auth_component_ready = False
-    st.session_state.auth_restore_generation = int(st.session_state.get("auth_restore_generation", 0)) + 1
 
     st.rerun()
 
@@ -828,24 +780,6 @@ def _get_sku_mapping_sku_column():
     return None
 
 
-def _sku_mappings_has_user_id():
-    """Check whether the installed sku_mappings table has a user_id column.
-
-    Newer database versions use user_id for Row Level Security.  We detect the
-    column instead of assuming every older installation has it.
-    """
-    cached = st.session_state.get("sku_mappings_has_user_id")
-    if cached is not None:
-        return bool(cached)
-    try:
-        supabase.table("sku_mappings").select("id,user_id").limit(1).execute()
-        st.session_state.sku_mappings_has_user_id = True
-        return True
-    except Exception:
-        st.session_state.sku_mappings_has_user_id = False
-        return False
-
-
 def _get_sku_mapping_master_column():
     """Resolve the master-product column without assuming one fixed schema.
 
@@ -937,24 +871,12 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
-    """Load mappings belonging to the current authenticated user/company."""
     company_id = get_company_id()
-    user_id = get_current_user_id()
-    if not company_id and not user_id:
+    if not company_id:
         return []
 
     try:
-        query = supabase.table("sku_mappings").select("*")
-
-        # sku_mappings RLS in the current database is based on user_id.  Use
-        # that column when available; this also prevents company_id from
-        # accidentally hiding a user's own mappings.
-        if _sku_mappings_has_user_id() and user_id:
-            query = query.eq("user_id", user_id)
-        elif company_id:
-            query = query.eq("company_id", company_id)
-
-        response = query.execute()
+        response = supabase.table("sku_mappings").select("*").eq("company_id", company_id).execute()
         sku_column = _get_sku_mapping_sku_column()
         master_column = _get_sku_mapping_master_column()
         return [_normalize_mapping_row(row, sku_column, master_column) for row in (response.data or [])]
@@ -962,21 +884,16 @@ def get_user_mappings():
         st.error(f"Could not load SKU mappings: {e}")
         return []
 
-def save_sku_mapping(sku, master_product_name):
-    """Save a user-approved SKU mapping.
 
-    The first-time assignment is always user initiated.  The saved row stores
-    user_id whenever that column exists so Supabase RLS can verify ownership.
-    """
+def save_sku_mapping(sku, master_product_name):
     sku = str(sku or "").strip()
     master_product_name = str(master_product_name or "").strip()
     if not sku or not master_product_name:
         return False
 
     company_id = get_company_id()
-    user_id = get_current_user_id()
-    if not user_id:
-        st.error("Could not save SKU mapping: your login session could not be verified.")
+    if not company_id:
+        st.error("Could not save SKU mapping: company information is missing.")
         return False
 
     sku_column = _get_sku_mapping_sku_column()
@@ -993,7 +910,10 @@ def save_sku_mapping(sku, master_product_name):
         )
         return False
 
-    master_value = _master_product_value_for_storage(master_column, master_product_name)
+    master_value = _master_product_value_for_storage(
+        master_column,
+        master_product_name,
+    )
     if master_value in (None, ""):
         st.error(
             "Could not save SKU mapping because the selected Master Product "
@@ -1001,15 +921,15 @@ def save_sku_mapping(sku, master_product_name):
         )
         return False
 
-    has_user_id = _sku_mappings_has_user_id()
-
     try:
-        query = supabase.table("sku_mappings").select("id").eq(sku_column, sku).limit(1)
-        if has_user_id:
-            query = query.eq("user_id", user_id)
-        elif company_id:
-            query = query.eq("company_id", company_id)
-        existing = query.execute()
+        existing = (
+            supabase.table("sku_mappings")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq(sku_column, sku)
+            .limit(1)
+            .execute()
+        )
 
         if existing.data:
             update_data = {master_column: master_value}
@@ -1021,16 +941,10 @@ def save_sku_mapping(sku, master_product_name):
             )
         else:
             insert_data = {
+                "company_id": company_id,
                 sku_column: sku,
                 master_column: master_value,
             }
-            if company_id:
-                insert_data["company_id"] = company_id
-            # This is the important RLS fix.  The database policy checks
-            # user_id = auth.uid(), so omitting user_id causes error 42501.
-            if has_user_id:
-                insert_data["user_id"] = user_id
-
             (
                 supabase.table("sku_mappings")
                 .insert(insert_data)
@@ -1038,9 +952,11 @@ def save_sku_mapping(sku, master_product_name):
             )
         return True
     except Exception as e:
+        # A Supabase schema cache can be stale immediately after a migration.
+        # Forget detected column names so a later rerun can detect the schema
+        # again instead of repeatedly using a stale name.
         st.session_state.pop("sku_mapping_sku_column", None)
         st.session_state.pop("sku_mapping_master_column", None)
-        st.session_state.pop("sku_mappings_has_user_id", None)
         st.error(f"Could not save SKU mapping: {e}")
         return False
 
@@ -2971,12 +2887,10 @@ def show_main_app():
 if st.session_state.user is None:
     restored = restore_login_from_cookie()
 
+    # Wait for the browser component naturally. Do NOT force a rerun here:
+    # repeated reruns can interrupt CookieManager and cause the exact
+    # "Restoring your login session" loop seen on refresh.
     if restored is None:
-        # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
-        # frontend component needs this run to remain alive long enough to read
-        # the browser cookies and send its value back to Streamlit. Repeated
-        # forced reruns can restart the component before it finishes, causing
-        # the endless "Restoring your login session" -> logout cycle.
         st.info("Restoring your login session…")
         st.stop()
 
