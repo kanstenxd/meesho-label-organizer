@@ -1439,6 +1439,82 @@ def _clean_extracted_value(value):
     return re.sub(r"\s+", " ", str(value or "")).strip(" :-\t\n")
 
 
+def _normalize_size_value(value):
+    """Return only the actual size mentioned on a label, otherwise empty.
+
+    Coordinate extraction can occasionally include nearby product-description
+    text in the Size column. We deliberately keep only a recognised size token
+    instead of returning the entire column text.
+    """
+    text = _clean_extracted_value(value)
+    if not text:
+        return ""
+
+    patterns = [
+        (r"\bfree\s+size\b", "Free Size"),
+        (r"\bone\s+size\b", "One Size"),
+        (r"\bxxxl\b", "XXXL"),
+        (r"\bxxl\b", "XXL"),
+        (r"\bxl\b", "XL"),
+        (r"\bxxs\b", "XXS"),
+        (r"\bxs\b", "XS"),
+        (r"\bsmall\b", "Small"),
+        (r"\bmedium\b", "Medium"),
+        (r"\blarge\b", "Large"),
+        (r"\bextra\s+large\b", "XL"),
+        (r"\bextra\s+small\b", "XS"),
+        (r"(?<![A-Za-z0-9])3XL(?![A-Za-z0-9])", "3XL"),
+        (r"(?<![A-Za-z0-9])2XL(?![A-Za-z0-9])", "2XL"),
+        (r"(?<![A-Za-z0-9])XL(?![A-Za-z0-9])", "XL"),
+        (r"(?<![A-Za-z0-9])L(?![A-Za-z0-9])", "L"),
+        (r"(?<![A-Za-z0-9])M(?![A-Za-z0-9])", "M"),
+        (r"(?<![A-Za-z0-9])S(?![A-Za-z0-9])", "S"),
+    ]
+    for pattern, normalized in patterns:
+        if re.search(pattern, text, flags=re.I):
+            return normalized
+
+    # Numeric garment/jewellery sizes are accepted only when they appear as a
+    # standalone value or with an explicit measurement unit. This prevents an
+    # order/reference number from becoming a size.
+    exact_numeric = re.fullmatch(r"\s*(\d{1,3}(?:\.\d+)?)\s*(cm|mm|inch|in)?\s*", text, flags=re.I)
+    if exact_numeric:
+        number = exact_numeric.group(1)
+        unit = exact_numeric.group(2)
+        return f"{number} {unit.lower()}" if unit else number
+
+    unit_match = re.search(r"\b(\d{1,3}(?:\.\d+)?)\s*(cm|mm|inch|in)\b", text, flags=re.I)
+    if unit_match:
+        return f"{unit_match.group(1)} {unit_match.group(2).lower()}"
+
+    return ""
+
+
+def _normalize_color_value(value):
+    """Return only the colour name from a noisy extracted colour cell."""
+    text = _clean_extracted_value(value)
+    if not text:
+        return ""
+
+    known_colors = [
+        "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
+        "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
+        "Golden", "Black", "White", "Red", "Blue", "Green", "Yellow",
+        "Orange", "Pink", "Purple", "Brown", "Grey", "Gray", "Gold",
+        "Silver", "Maroon", "Beige", "Cream", "Peach", "Turquoise",
+        "Violet", "Olive", "Mustard", "Coral",
+    ]
+    for color in sorted(known_colors, key=len, reverse=True):
+        match = re.search(rf"(?<![A-Za-z]){re.escape(color)}(?![A-Za-z])", text, flags=re.I)
+        if match:
+            normalized = match.group(0)
+            # Keep the requested display spelling consistent.
+            if normalized.lower() == "multi color":
+                return "Multicolor"
+            return normalized.title() if normalized.lower() not in {"multicolor"} else "Multicolor"
+    return ""
+
+
 def _is_invalid_sku(value):
     value = _clean_extracted_value(value)
     normalized = value.lower().rstrip(".:").strip()
@@ -1615,8 +1691,10 @@ def _extract_visual_table_values(page):
             match = re.search(r"\b(\d+)\b", value)
             if match:
                 result[field] = max(1, int(match.group(1)))
-        else:
-            result[field] = value
+        elif field == "size":
+            result[field] = _normalize_size_value(value)
+        elif field == "color":
+            result[field] = _normalize_color_value(value)
 
     return result
 
@@ -1726,9 +1804,13 @@ def parse_product_details(page_text, page=None):
         return cleaned[0]
 
     result["sku"] = choose_best(line_values_after_label(("SKU",), for_sku=True), for_sku=True)
-    result["size"] = choose_best(line_values_after_label(("Size",)))
+    result["size"] = _normalize_size_value(
+        choose_best(line_values_after_label(("Size",)))
+    )
     qty_values = line_values_after_label(("Qty", "Quantity"))
-    result["color"] = choose_best(line_values_after_label(("Color", "Colour")))
+    result["color"] = _normalize_color_value(
+        choose_best(line_values_after_label(("Color", "Colour")))
+    )
 
     for value in qty_values:
         qty_match = re.search(r"\b(\d+)\b", value)
@@ -1766,7 +1848,7 @@ def parse_product_details(page_text, page=None):
         color_match = re.search(rf"\b({color_pattern})\s*$", working, flags=re.I)
         if color_match:
             if not result["color"]:
-                result["color"] = clean_value(color_match.group(1))
+                result["color"] = _normalize_color_value(color_match.group(1))
             working = working[:color_match.start()].strip()
         qty_match = re.search(r"\b(\d{1,4})\s*$", working)
         if qty_match:
@@ -1776,7 +1858,7 @@ def parse_product_details(page_text, page=None):
         size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
         if size_match:
             if not result["size"]:
-                result["size"] = clean_value(size_match.group(1))
+                result["size"] = _normalize_size_value(size_match.group(1))
             working = working[:size_match.start()].strip()
         candidate = clean_value(working)
         if not is_label_or_metadata(candidate, True):
@@ -1784,6 +1866,11 @@ def parse_product_details(page_text, page=None):
 
     if is_label_or_metadata(result["sku"], True):
         result["sku"] = ""
+
+    # Final cleanup guarantees that noisy neighbouring text, SKU/order numbers
+    # and other column spillover never appear in Size or Color.
+    result["size"] = _normalize_size_value(result.get("size", ""))
+    result["color"] = _normalize_color_value(result.get("color", ""))
     return result
 
 
