@@ -71,6 +71,7 @@ DEFAULT_SESSION_STATE = {
     "auth_cookie_seen": False,
     "auth_component_ready": False,
     "auth_restore_generation": 0,
+    "logout_requested": False,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -299,6 +300,7 @@ def restore_login_from_cookie():
 
     if user:
         st.session_state.user = user
+        st.session_state.logout_requested = False
         st.session_state.auth_restored = True
         st.session_state.auth_restore_attempts = 0
         st.session_state.auth_restore_pending = False
@@ -624,6 +626,7 @@ def register_user(company_name, email, password):
 
         if session:
             st.session_state.user = user
+            st.session_state.logout_requested = False
             st.session_state.auth_restored = True
             save_auth_session(session)
             refresh_profile()
@@ -659,8 +662,10 @@ def logout():
     except Exception:
         pass
 
+    # Ask the browser to delete persistent authentication cookies.
     clear_auth_cookies()
 
+    # Clear the current Streamlit session.
     st.session_state.user = None
     st.session_state.profile = None
     st.session_state.batch_results = None
@@ -671,9 +676,17 @@ def logout():
     st.session_state.auth_restore_started_at = None
     st.session_state.auth_cookie_seen = False
     st.session_state.auth_component_ready = False
-    st.session_state.auth_restore_generation = int(st.session_state.get("auth_restore_generation", 0)) + 1
 
-    st.rerun()
+    # Prevent this same Streamlit session from restoring the old cookies
+    # while CookieManager is still processing the delete commands.
+    st.session_state.logout_requested = True
+
+    st.session_state.auth_restore_generation = (
+        int(st.session_state.get("auth_restore_generation", 0)) + 1
+    )
+
+    # Do not call st.rerun() here. The current run must finish so the
+    # CookieManager component can send the cookie-deletion changes to the browser.
 
 
 # ============================================================
@@ -3046,20 +3059,24 @@ def show_main_app():
 # APPLICATION START
 # ============================================================
 
-if st.session_state.user is None:
-    restored = restore_login_from_cookie()
-
-    if restored is None:
-        # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
-        # frontend component needs this run to remain alive long enough to read
-        # the browser cookies and send its value back to Streamlit. Repeated
-        # forced reruns can restart the component before it finishes, causing
-        # the endless "Restoring your login session" -> logout cycle.
-        st.info("Restoring your login session…")
-        st.stop()
-
-if st.session_state.user is None:
+# If the user explicitly clicked Logout, do not try to restore the
+# previous authentication cookies during this Streamlit session.
+if st.session_state.get("logout_requested", False):
     show_auth_page()
+
+else:
+    if st.session_state.user is None:
+        restored = restore_login_from_cookie()
+
+        if restored is None:
+            # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
+            # frontend component needs this run to remain alive long enough to read
+            # the browser cookies and send its value back to Streamlit.
+            st.info("Restoring your login session…")
+            st.stop()
+
+    if st.session_state.user is None:
+        show_auth_page()
 
 # A successful login can happen during show_auth_page() in the same script run.
 # Re-check the session afterwards instead of forcing an immediate rerun, because
