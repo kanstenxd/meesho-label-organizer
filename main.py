@@ -111,13 +111,12 @@ def normalize_text(text):
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 def normalize_sku_key(text):
-    """Create a strict identity key for saved SKU mappings.
+    """Return the SKU exactly as extracted for strict remembered mappings.
 
-    PDF text extraction can change spaces, underscores, hyphens and line
-    wrapping. For a previously approved SKU we want all of those formatting
-    differences to resolve to the same mapping.
+    Capitalization, spaces, hyphens, underscores and every other character are
+    significant. Only an *identical* SKU string can reuse a saved mapping.
     """
-    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+    return str(text or "")
 
 
 def get_current_user_id():
@@ -1208,14 +1207,14 @@ def get_user_mappings():
                 except Exception:
                     pass
 
-            row["sku"] = str(sku or "").strip()
+            row["sku"] = str(sku or "")
             row["master_product_name"] = str(master_name or "").strip()
             row["master_product_id"] = master_id
 
             if row["sku"]:
                 mappings.append(row)
 
-        # Keep the newest usable mapping for every normalized SKU. A usable
+        # Keep the newest usable mapping for every exact SKU string. A usable
         # resolved Master Product always wins over an older broken/empty row.
         deduplicated = {}
         for mapping in mappings:
@@ -1239,11 +1238,10 @@ def get_user_mappings():
 def save_sku_mapping(sku, master_product_name):
     """Create or update a user-approved SKU → Master Product mapping.
 
-    Existing mappings are matched by normalized SKU, not only literal text, so
-    the same SKU with different punctuation/case cannot create a second row or
-    lose its previous manual assignment.
+    Existing mappings are matched by the exact SKU text. Capitalization, spaces,
+    hyphens and underscores are all significant.
     """
-    sku = str(sku or "").strip()
+    sku = str(sku or "")
     master_product_name = str(master_product_name or "").strip()
     if not sku or not master_product_name:
         return False
@@ -1299,7 +1297,7 @@ def save_sku_mapping(sku, master_product_name):
         existing_row = None
         for row in existing_rows:
             stored_sku = row.get(sku_column)
-            if normalize_sku_key(stored_sku) == sku_norm:
+            if str(stored_sku or "") == sku:
                 existing_row = row
                 break
 
@@ -1403,12 +1401,12 @@ def extract_product_section(page_text):
 
 
 def parse_product_details(page_text):
-    """
-    Extract SKU, Size, Qty and Color from every PDF page.
+    """Extract the explicitly labelled SKU, Size, Qty and Color fields.
 
-    Long Meesho product names often wrap over multiple lines, so parsing
-    works from right to left:
-        Product Name / SKU | Size | Qty | Color
+    Meesho labels can contain a long Order No./product description elsewhere on
+    the page. That text is *not* the SKU. When a Product Details block contains
+    labelled fields, the value immediately associated with ``SKU`` is used as
+    the SKU, while Size, Qty and Color are extracted independently.
     """
     section = extract_product_section(page_text)
 
@@ -1423,88 +1421,113 @@ def parse_product_details(page_text):
     if not section:
         return result
 
-    text = re.sub(r"SKU\s+Size\s+Qty\s+Color", "", section, flags=re.I)
-    working = re.sub(r"\s+", " ", text).strip()
-
-    known_colors = [
-        "Multicolor",
-        "Multi Color",
-        "Rose Gold",
-        "Light Blue",
-        "Dark Blue",
-        "Sky Blue",
-        "Navy Blue",
-        "Bottle Green",
-        "Sea Green",
-        "Off White",
-        "Black",
-        "White",
-        "Red",
-        "Blue",
-        "Green",
-        "Yellow",
-        "Orange",
-        "Pink",
-        "Purple",
-        "Brown",
-        "Grey",
-        "Gray",
-        "Gold",
-        "Silver",
-        "Maroon",
-        "Beige",
-        "Cream",
+    # Preserve line boundaries because the PDF often renders fields as:
+    # Product Details / SKU / <exact SKU> / Size / <size> / Qty / <qty> / Color / <color>
+    raw_lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in section.splitlines()
+        if re.sub(r"\s+", " ", line).strip()
     ]
 
-    color_pattern = "|".join(
-        re.escape(color)
-        for color in sorted(known_colors, key=len, reverse=True)
-    )
+    field_names = {"sku", "size", "qty", "quantity", "color", "colour"}
 
-    color_match = re.search(
-        rf"\b({color_pattern})\s*$",
-        working,
-        flags=re.I,
-    )
+    def value_after_label(labels):
+        labels = tuple(label.lower() for label in labels)
 
-    if color_match:
-        result["color"] = re.sub(
-            r"\s+",
-            " ",
-            color_match.group(1),
-        ).strip()
-        working = working[:color_match.start()].strip()
+        for index, line in enumerate(raw_lines):
+            compact = line.strip()
+            lower = compact.lower().rstrip(":-").strip()
 
-    qty_match = re.search(r"\b(\d{1,4})\s*$", working)
+            # Label and value on the same line, e.g. SKU: Royal Ring GFR 002
+            for label in labels:
+                inline = re.match(
+                    rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
+                    compact,
+                    flags=re.I,
+                )
+                if inline:
+                    value = inline.group(1).strip()
+                    if value:
+                        return value
 
-    if qty_match:
-        qty = int(qty_match.group(1))
-        if qty > 0:
-            result["qty"] = qty
+            # Label on its own line; use the next non-label line exactly as shown.
+            if lower in labels:
+                for next_index in range(index + 1, len(raw_lines)):
+                    candidate = raw_lines[next_index]
+                    candidate_lower = candidate.lower().rstrip(":-").strip()
+                    if candidate_lower in field_names:
+                        continue
+                    return candidate
+
+        # Fallback for text extraction that places all fields on one line.
+        flat = "\n".join(raw_lines)
+        for label in labels:
+            match = re.search(
+                rf"\b{re.escape(label)}\b\s*[:\-]?\s*(.+?)(?=\n\s*(?:SKU|Size|Qty|Quantity|Color|Colour)\b|$)",
+                flat,
+                flags=re.I | re.S,
+            )
+            if match:
+                value = re.sub(r"\s+", " ", match.group(1)).strip()
+                if value:
+                    return value
+        return ""
+
+    # Priority: explicitly labelled values. SKU is intentionally not derived
+    # from Order No. or the long product description.
+    result["sku"] = value_after_label(("SKU",))
+    result["size"] = value_after_label(("Size",))
+    qty_value = value_after_label(("Qty", "Quantity"))
+    result["color"] = value_after_label(("Color", "Colour"))
+
+    if qty_value:
+        qty_match = re.search(r"\d+", qty_value)
+        if qty_match:
+            result["qty"] = max(1, int(qty_match.group(0)))
+
+    # If a particular PDF layout does not expose separate labels, retain the
+    # older right-to-left table parsing only as a fallback.
+    if not result["sku"]:
+        text = re.sub(r"SKU\s+Size\s+Qty\s+Color", "", section, flags=re.I)
+        working = re.sub(r"\s+", " ", text).strip()
+
+        known_colors = [
+            "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
+            "Dark Blue", "Sky Blue", "Navy Blue", "Bottle Green",
+            "Sea Green", "Off White", "Black", "White", "Red", "Blue",
+            "Green", "Yellow", "Orange", "Pink", "Purple", "Brown",
+            "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
+        ]
+        color_pattern = "|".join(
+            re.escape(color)
+            for color in sorted(known_colors, key=len, reverse=True)
+        )
+
+        color_match = re.search(
+            rf"\b({color_pattern})\s*$", working, flags=re.I
+        )
+        if color_match:
+            if not result["color"]:
+                result["color"] = re.sub(r"\s+", " ", color_match.group(1)).strip()
+            working = working[:color_match.start()].strip()
+
+        qty_match = re.search(r"\b(\d{1,4})\s*$", working)
+        if qty_match:
+            if not qty_value:
+                result["qty"] = max(1, int(qty_match.group(1)))
             working = working[:qty_match.start()].strip()
 
-    size_pattern = (
-        r"Free\s+Size|One\s+Size|"
-        r"XXS|XS|S|M|L|XL|XXL|XXXL|"
-        r"Small|Medium|Large|"
-        r"\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
-    )
+        size_pattern = (
+            r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
+            r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
+        )
+        size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
+        if size_match:
+            if not result["size"]:
+                result["size"] = re.sub(r"\s+", " ", size_match.group(1)).strip()
+            working = working[:size_match.start()].strip()
 
-    size_match = re.search(
-        rf"\b({size_pattern})\s*$",
-        working,
-        flags=re.I,
-    )
-
-    if size_match:
-        result["size"] = re.sub(
-            r"\s+",
-            " ",
-            size_match.group(1),
-        ).strip()
-        working = working[:size_match.start()].strip()
-
-    result["sku"] = re.sub(r"\s+", " ", working).strip()
+        result["sku"] = re.sub(r"\s+", " ", working).strip()
 
     return result
 
@@ -1640,7 +1663,7 @@ def find_matching_master_product(
        normalized SKU mapping is saved and will be reused automatically in
        future uploads. Matching ignores case, underscores and hyphens.
     """
-    sku = str(extracted.get("sku", "") or "").strip()
+    sku = str(extracted.get("sku", "") or "")
     sku_norm = normalize_sku_key(sku)
 
     if not sku_norm:
@@ -1651,7 +1674,7 @@ def find_matching_master_product(
             [],
         )
 
-    # Priority 1: saved exact SKU mapping.
+    # Priority 1: saved literal SKU mapping. Every character is significant.
     for mapping in mappings:
         if normalize_sku_key(mapping.get("sku")) == sku_norm:
             resolved_master = str(
@@ -1913,7 +1936,7 @@ def apply_review_assignment(
     Apply a user-approved similar match to every extracted page having the
     same SKU, persist the mapping, and update the current batch in memory.
     """
-    sku = str(sku or "").strip()
+    sku = str(sku or "")
     master_product_name = str(
         master_product_name or ""
     ).strip()
@@ -2706,7 +2729,7 @@ def show_pdf_organizer():
         st.divider()
         st.subheader("🔍 Review Similar SKU Matches")
         st.info(
-            "Every SKU that has not been assigned by you previously requires "
+            "Every SKU that has not been assigned with the exact same text previously requires "
             "your confirmation. The app will suggest the best possible Master "
             "Products, but it will not assign a first-time SKU automatically. "
             "Once you assign it, the mapping is remembered and the same SKU "
