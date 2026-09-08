@@ -6,6 +6,7 @@ import re
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 import time
+import uuid
 import extra_streamlit_components as stx
 
 st.set_page_config(
@@ -83,6 +84,17 @@ DEFAULT_SESSION_STATE = {
     # after a full browser refresh/new Streamlit session.
     "supabase_access_token": None,
     "supabase_refresh_token": None,
+    # Lightweight per-session caches reduce repeated Supabase reads during
+    # Streamlit reruns and make navigation noticeably faster.
+    "inventory_cache": None,
+    "inventory_cache_company_id": None,
+    "inventory_cache_loaded_at": None,
+    "subscription_cache": None,
+    "subscription_cache_user_id": None,
+    "subscription_cache_loaded_at": None,
+    # Each generated Pick-Up List receives one stable ID. Inventory may be
+    # deducted only once for that specific list during the active session.
+    "deducted_pickup_lists": set(),
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -539,6 +551,27 @@ def get_company_id():
 # ============================================================
 
 def get_subscription_status():
+    user_id = get_current_user_id()
+    cached_status = st.session_state.get("subscription_cache")
+    cached_user_id = st.session_state.get("subscription_cache_user_id")
+    cached_at = st.session_state.get("subscription_cache_loaded_at")
+
+    if (
+        cached_status is not None
+        and cached_user_id == user_id
+        and cached_at is not None
+        and time.time() - float(cached_at) < SUBSCRIPTION_CACHE_SECONDS
+    ):
+        return cached_status
+
+    status = _get_subscription_status_uncached()
+    st.session_state.subscription_cache = status
+    st.session_state.subscription_cache_user_id = user_id
+    st.session_state.subscription_cache_loaded_at = time.time()
+    return status
+
+
+def _get_subscription_status_uncached():
     if is_admin():
         return {
             "access": True,
@@ -546,10 +579,11 @@ def get_subscription_status():
             "reason": "Full administrator application access",
         }
 
+    user_id = get_current_user_id()
+
     # Subscription access belongs to the authenticated user. A missing
     # company profile must not break login or subscription checks.
     profile = st.session_state.get("profile") or {}
-    user_id = get_current_user_id()
 
     if not user_id:
         return {
@@ -649,6 +683,7 @@ def start_demo():
             .execute()
         )
         refresh_profile()
+        invalidate_subscription_cache()
         return True
     except Exception as e:
         st.error(f"Could not start demo: {e}")
@@ -792,6 +827,10 @@ def logout():
         "auth_restore_attempts", "auth_restore_pending",
         "auth_restore_started_at", "auth_cookie_seen",
         "auth_component_ready", "auth_cookie_checked_once",
+        "inventory_cache", "inventory_cache_company_id",
+        "inventory_cache_loaded_at", "subscription_cache",
+        "subscription_cache_user_id", "subscription_cache_loaded_at",
+        "deducted_pickup_lists",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -810,11 +849,43 @@ def logout():
 # MASTER PRODUCT DATABASE FUNCTIONS
 # ============================================================
 
+INVENTORY_CACHE_SECONDS = 20
+SUBSCRIPTION_CACHE_SECONDS = 30
+
+def invalidate_inventory_cache():
+    st.session_state.inventory_cache = None
+    st.session_state.inventory_cache_company_id = None
+    st.session_state.inventory_cache_loaded_at = None
+
+def invalidate_subscription_cache():
+    st.session_state.subscription_cache = None
+    st.session_state.subscription_cache_user_id = None
+    st.session_state.subscription_cache_loaded_at = None
+
 def get_inventory():
     company_id = get_company_id()
 
     if not company_id:
         return []
+
+    cached_company_id = st.session_state.get(
+        "inventory_cache_company_id"
+    )
+    cached_at = st.session_state.get(
+        "inventory_cache_loaded_at"
+    )
+    cached_inventory = st.session_state.get(
+        "inventory_cache"
+    )
+
+    if (
+        cached_inventory is not None
+        and cached_company_id == company_id
+        and cached_at is not None
+        and time.time() - float(cached_at)
+        < INVENTORY_CACHE_SECONDS
+    ):
+        return cached_inventory
 
     try:
         response = (
@@ -824,11 +895,14 @@ def get_inventory():
             .order("product_name")
             .execute()
         )
-        return response.data or []
+        inventory = response.data or []
+        st.session_state.inventory_cache = inventory
+        st.session_state.inventory_cache_company_id = company_id
+        st.session_state.inventory_cache_loaded_at = time.time()
+        return inventory
     except Exception as e:
         st.error(f"Inventory loading error: {e}")
         return []
-
 
 def add_master_product(product_name, inventory_quantity, minimum_stock):
     try:
@@ -845,6 +919,7 @@ def add_master_product(product_name, inventory_quantity, minimum_stock):
             )
             .execute()
         )
+        invalidate_inventory_cache()
         return response is not None
     except Exception as e:
         st.error(f"Could not add product: {e}")
@@ -873,6 +948,7 @@ def update_master_product(
             .eq("company_id", get_company_id())
             .execute()
         )
+        invalidate_inventory_cache()
         return response
 
     except Exception as e:
@@ -918,6 +994,7 @@ def delete_master_product(product_id, product_name):
             .eq("company_id", company_id)
             .execute()
         )
+        invalidate_inventory_cache()
         return True
     except Exception as e:
         st.error(f"Could not delete Master Product: {e}")
@@ -974,6 +1051,7 @@ def update_inventory(product_id, new_quantity, reason=None):
         except Exception:
             pass
 
+        invalidate_inventory_cache()
         return True
 
     except Exception as e:
@@ -1988,6 +2066,10 @@ def apply_review_assignment(
         None,
     )
 
+    # A manual assignment changes the organization, so invalidate any PDF
+    # bytes cached from an earlier version of this batch.
+    results.pop("reorganized_pdf_bytes", None)
+
     return True
 
 
@@ -2621,6 +2703,9 @@ def show_pdf_organizer():
         ):
             try:
                 results = reorganize_pdfs(uploaded_files)
+                # One stable identifier represents this exact generated
+                # Pick-Up List/batch for the remainder of the session.
+                results["pickup_list_id"] = str(uuid.uuid4())
                 st.session_state.batch_results = results
 
                 try:
@@ -2946,35 +3031,74 @@ def show_pdf_organizer():
         st.subheader("📦 Inventory Action")
 
         st.warning(
-            "This subtracts the extracted Total Quantity from inventory."
+            "This subtracts the extracted Total Quantity from inventory. "
+            "For safety, each generated Pick-Up List can be deducted only once."
         )
 
-        if st.button(
-            "➖ Deduct Pick-Up List From Inventory",
-            type="primary",
-        ):
-            success_count, failed = (
-                deduct_inventory_from_pickup(
-                    pickup_dataframe
-                )
+        pickup_list_id = results.get("pickup_list_id")
+        if not pickup_list_id:
+            pickup_list_id = str(uuid.uuid4())
+            results["pickup_list_id"] = pickup_list_id
+            st.session_state.batch_results = results
+
+        deducted_lists = st.session_state.get(
+            "deducted_pickup_lists", set()
+        )
+        already_deducted = pickup_list_id in deducted_lists
+
+        if already_deducted:
+            st.success(
+                "✓ Inventory has already been deducted for this Pick-Up List. "
+                "It cannot be deducted again by refreshing or revisiting this batch."
             )
+        else:
+            if st.button(
+                "➖ Deduct Pick-Up List From Inventory",
+                type="primary",
+                key=f"deduct_pickup_{pickup_list_id}",
+            ):
+                # Mark this list as used before performing the updates so a
+                # rerun/double-click cannot deduct the same list twice.
+                deducted_lists = set(deducted_lists)
+                deducted_lists.add(pickup_list_id)
+                st.session_state.deducted_pickup_lists = deducted_lists
 
-            if success_count:
-                st.success(
-                    f"Inventory updated for "
-                    f"{success_count} product(s)."
+                success_count, failed = (
+                    deduct_inventory_from_pickup(
+                        pickup_dataframe
+                    )
                 )
 
-            for error in failed:
-                st.error(error)
+                if success_count:
+                    st.success(
+                        f"Inventory updated for "
+                        f"{success_count} product(s). This Pick-Up List is now locked "
+                        "from further deductions."
+                    )
+
+                if failed:
+                    st.warning(
+                        "This Pick-Up List has still been locked to prevent duplicate "
+                        "stock deductions. The following products could not be updated:"
+                    )
+                    for error in failed:
+                        st.error(error)
+
+                st.rerun()
 
     st.subheader("📄 Download Reorganized Labels")
 
     if categorized or uncategorized:
-        output_pdf = create_reorganized_pdf(
-            categorized,
-            uncategorized,
-        )
+        # Building the PDF is relatively expensive. Keep the generated bytes
+        # with the current batch instead of rebuilding them on every rerun.
+        output_pdf = results.get("reorganized_pdf_bytes")
+        if output_pdf is None:
+            output_pdf = create_reorganized_pdf(
+                categorized,
+                uncategorized,
+            )
+            results["reorganized_pdf_bytes"] = output_pdf
+            st.session_state.batch_results = results
 
         st.download_button(
             "⬇️ Download Reorganized PDF",
@@ -3184,11 +3308,9 @@ def show_subscription_page():
 # ============================================================
 
 def show_main_app():
-    # Every Streamlit interaction starts a new script run and recreates the
-    # Supabase client. Reattach the logged-in JWT before any RLS-protected page
-    # performs database work.
-    sync_supabase_auth_from_cookie()
-
+    # Authentication is synchronized once during application startup before
+    # this function is called. Avoid a second Supabase round-trip here so page
+    # navigation and ordinary widget reruns remain responsive.
     profile = st.session_state.get("profile") or {}
 
     company_name = (
