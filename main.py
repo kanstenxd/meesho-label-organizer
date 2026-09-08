@@ -20,6 +20,7 @@ LIFETIME_PRICE = 9999
 DEMO_HOURS = 12
 DEMO_PDF_LIMIT = 2
 ADMIN_EMAILS = {"keyurtank8@gmail.com"}
+APP_URL = "https://meesho-label-organizer.streamlit.app"
 
 COOKIE_ACCESS = "meesho_access_token"
 COOKIE_REFRESH = "meesho_refresh_token"
@@ -219,13 +220,7 @@ def _get_response_session(response):
 
 
 def restore_login_from_cookie():
-    """Restore authentication after refresh.
-
-    IMPORTANT: Nothing in this function logs a user out or deletes cookies.
-    A fresh Streamlit session is created on browser refresh, so the app waits
-    for CookieManager to become available before deciding whether to show the
-    login screen.
-    """
+    """Restore an authenticated Supabase session from browser cookies."""
     if st.session_state.get("user") is not None:
         st.session_state.auth_restored = True
         st.session_state.auth_restore_pending = False
@@ -233,38 +228,21 @@ def restore_login_from_cookie():
 
     access_token, refresh_token, marker, has_auth_cookie, component_ready = _get_cookie_auth()
 
-    # The custom component may need multiple reruns after a hard refresh.
+    # CookieManager has not returned a usable value yet. Stop only in this case.
     if not component_ready:
         st.session_state.auth_restore_pending = True
         return None
 
     st.session_state.auth_component_ready = True
 
-    if has_auth_cookie:
-        st.session_state.auth_cookie_seen = True
-
-    # If no auth cookies are currently visible, wait for a short initialization
-    # window before treating this as a genuinely logged-out visitor. This avoids
-    # the common refresh race where get_all() initially returns {}.
+    # An empty cookie dictionary means this visitor is logged out. Do not wait
+    # for a timer here: Streamlit has no automatic timer rerun, so waiting would
+    # leave the app permanently stuck on “Restoring your login session…”.
     if not access_token or not refresh_token:
-        started = st.session_state.get("auth_restore_started_at")
-        if started is None:
-            started = time.time()
-            st.session_state.auth_restore_started_at = started
-
-        elapsed = time.time() - float(started)
-        if elapsed < 8.0:
-            st.session_state.auth_restore_attempts = int(st.session_state.get("auth_restore_attempts", 0)) + 1
-            st.session_state.auth_restore_pending = True
-            return None
-
-        # We only reach False after CookieManager has had time to initialize.
-        # No cookies are deleted here.
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
 
-    # Both tokens are present. Restore the exact Supabase session first.
     session = None
     try:
         response = supabase.auth.set_session(access_token, refresh_token)
@@ -272,7 +250,6 @@ def restore_login_from_cookie():
     except Exception:
         session = None
 
-    # Supabase versions differ in refresh_session's signature. Try both forms.
     if not session:
         try:
             response = supabase.auth.refresh_session()
@@ -307,10 +284,10 @@ def restore_login_from_cookie():
         st.session_state.auth_restore_started_at = None
         return True
 
-    # A transient Supabase failure must never be converted into a logout.
-    # Keep attempting restoration while the browser tokens remain present.
-    st.session_state.auth_restore_pending = True
-    return None
+    # Invalid or expired tokens should not trap the visitor in a restore loop.
+    st.session_state.auth_restore_pending = False
+    st.session_state.auth_restored = True
+    return False
 
 
 # ============================================================
@@ -544,6 +521,7 @@ def count_demo_pdfs():
 # ============================================================
 
 def login_user(email, password):
+    """Log in and update the Streamlit session immediately."""
     try:
         response = supabase.auth.sign_in_with_password(
             {
@@ -557,47 +535,38 @@ def login_user(email, password):
 
         if not user:
             st.error("Login failed. Please check your email and password.")
-            return
+            return False
 
         st.session_state.user = user
+        st.session_state.logout_requested = False
         st.session_state.auth_restored = True
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restore_started_at = None
 
         if session:
             save_auth_session(session)
-        else:
-            # Keep a login marker even if the auth response does not expose
-            # the session object in this client version.
-            try:
-                cookie_manager.set(COOKIE_LOGIN_MARKER, str(user.id), expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS))
-            except Exception:
-                pass
 
         refresh_profile()
-        # IMPORTANT: Do not call st.rerun() immediately after setting cookies.
-        # CookieManager sends the set-cookie command to the browser only when
-        # this script run is allowed to finish. An immediate rerun can cancel
-        # that command, leaving no persistent login cookies after refresh.
-        st.success("Login successful! Your login will remain active until you click Logout.")
         return True
 
     except Exception as e:
         message = str(e).lower()
-
         if "invalid login credentials" in message:
             st.error("Incorrect email or password.")
         elif "email not confirmed" in message:
             st.error("Please confirm your email before logging in.")
         else:
             st.error(f"Login failed: {e}")
-
+        return False
 
 def register_user(company_name, email, password):
+    """Create a Supabase account and send confirmation to the deployed app URL."""
     company_name = company_name.strip()
     email = email.strip().lower()
 
     if not company_name or not email or not password:
         st.error("Please complete all fields.")
-        return
+        return False
 
     try:
         response = supabase.auth.sign_up(
@@ -605,88 +574,75 @@ def register_user(company_name, email, password):
                 "email": email,
                 "password": password,
                 "options": {
-                    "data": {
-                        "company_name": company_name,
-                    }
+                    "data": {"company_name": company_name},
+                    # This must match a URL allowed in Supabase Auth > URL Configuration.
+                    "email_redirect_to": APP_URL,
                 },
             }
         )
 
         user = getattr(response, "user", None)
-
         if not user:
             st.error("Account registration failed.")
-            return
+            return False
 
         if getattr(user, "identities", None) == []:
             st.error("This email is already registered. Please log in instead.")
-            return
+            return False
 
         session = getattr(response, "session", None)
-
         if session:
             st.session_state.user = user
             st.session_state.logout_requested = False
             st.session_state.auth_restored = True
             save_auth_session(session)
             refresh_profile()
-            # Let this Streamlit run finish so CookieManager can persist the
-            # new authentication cookies before any later browser refresh.
-            st.success("Account created successfully! Your login will remain active until you click Logout.")
             return True
-        else:
-            st.success(
-                "Account created. Please confirm your email, then log in."
-            )
+
+        st.success(
+            "Account created successfully! Check your email and confirm your account. "
+            "After confirmation, return here and log in."
+        )
+        return False
 
     except Exception as e:
         message = str(e).lower()
-
         if any(
             phrase in message
-            for phrase in [
-                "already registered",
-                "already exists",
-                "duplicate",
-                "email_exists",
-            ]
+            for phrase in ["already registered", "already exists", "duplicate", "email_exists"]
         ):
             st.error("This email is already registered. Please log in instead.")
         else:
             st.error(f"Registration failed: {e}")
-
+        return False
 
 def logout():
+    """Clear Supabase authentication and local Streamlit state."""
     try:
         supabase.auth.sign_out()
     except Exception:
         pass
 
-    # Ask the browser to delete persistent authentication cookies.
     clear_auth_cookies()
 
-    # Clear the current Streamlit session.
-    st.session_state.user = None
-    st.session_state.profile = None
-    st.session_state.batch_results = None
+    # Clear all application-specific authentication state.
+    for key in [
+        "user", "profile", "batch_results", "auth_restored",
+        "auth_restore_attempts", "auth_restore_pending",
+        "auth_restore_started_at", "auth_cookie_seen",
+        "auth_component_ready",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
     st.session_state.current_page = "Dashboard"
-    st.session_state.auth_restored = False
-    st.session_state.auth_restore_attempts = 0
-    st.session_state.auth_restore_pending = False
-    st.session_state.auth_restore_started_at = None
-    st.session_state.auth_cookie_seen = False
-    st.session_state.auth_component_ready = False
-
-    # Prevent this same Streamlit session from restoring the old cookies
-    # while CookieManager is still processing the delete commands.
     st.session_state.logout_requested = True
-
     st.session_state.auth_restore_generation = (
         int(st.session_state.get("auth_restore_generation", 0)) + 1
     )
 
-    # Do not call st.rerun() here. The current run must finish so the
-    # CookieManager component can send the cookie-deletion changes to the browser.
+    # Render the logged-out page in the next script run.
+    st.rerun()
 
 
 # ============================================================
@@ -1855,70 +1811,37 @@ def show_auth_page():
         """
     )
 
-    login_tab, register_tab = st.tabs(
-        ["🔐 Login", "📝 Register"]
-    )
+    login_tab, register_tab = st.tabs(["🔐 Login", "📝 Register"])
 
     with login_tab:
-        email = st.text_input(
-            "Email",
-            key="login_email",
-        )
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="login_password",
-        )
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
 
-        if st.button(
-            "Login",
-            type="primary",
-            use_container_width=True,
-        ):
+        if st.button("Login", type="primary", use_container_width=True):
             if not email or not password:
-                st.warning(
-                    "Please enter your email and password."
-                )
-            else:
-                login_user(email, password)
+                st.warning("Please enter your email and password.")
+            elif login_user(email, password):
+                # A rerun prevents the login/register page and dashboard from
+                # being rendered together after a successful login.
+                st.rerun()
 
     with register_tab:
-        company_name = st.text_input(
-            "Company Name",
-            key="register_company",
-        )
-        email = st.text_input(
-            "Email",
-            key="register_email",
-        )
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="register_password",
-        )
+        company_name = st.text_input("Company Name", key="register_company")
+        email = st.text_input("Email", key="register_email")
+        password = st.text_input("Password", type="password", key="register_password")
         confirm_password = st.text_input(
-            "Confirm Password",
-            type="password",
-            key="register_confirm_password",
+            "Confirm Password", type="password", key="register_confirm_password"
         )
 
-        if st.button(
-            "Create Account",
-            type="primary",
-            use_container_width=True,
-        ):
+        if st.button("Create Account", type="primary", use_container_width=True):
             if password != confirm_password:
                 st.error("Passwords do not match.")
             elif len(password) < 6:
-                st.error(
-                    "Password must contain at least 6 characters."
-                )
+                st.error("Password must contain at least 6 characters.")
             else:
-                register_user(
-                    company_name,
-                    email,
-                    password,
-                )
+                created_and_logged_in = register_user(company_name, email, password)
+                if created_and_logged_in:
+                    st.rerun()
 
 
 # ============================================================
@@ -3059,33 +2982,22 @@ def show_main_app():
 # APPLICATION START
 # ============================================================
 
-# If the user explicitly clicked Logout, do not try to restore the
-# previous authentication cookies during this Streamlit session.
+# Explicit logout: never restore an old browser session during the logout run.
 if st.session_state.get("logout_requested", False):
     show_auth_page()
-
 else:
-    if st.session_state.user is None:
+    if st.session_state.get("user") is None:
         restored = restore_login_from_cookie()
 
         if restored is None:
-            # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
-            # frontend component needs this run to remain alive long enough to read
-            # the browser cookies and send its value back to Streamlit.
+            # Wait for CookieManager/Supabase rather than rendering two pages.
             st.info("Restoring your login session…")
             st.stop()
 
-    if st.session_state.user is None:
+    if st.session_state.get("user") is None:
         show_auth_page()
+    else:
+        if st.session_state.get("profile") is None:
+            refresh_profile()
+        show_main_app()
 
-# A successful login can happen during show_auth_page() in the same script run.
-# Re-check the session afterwards instead of forcing an immediate rerun, because
-# the current run must finish for CookieManager to write browser cookies.
-if st.session_state.user is not None:
-    # A missing profile is a database/profile issue, not an authentication issue.
-    # Never log out or block an authenticated user because another user's profile
-    # row is missing or temporarily unavailable.
-    if st.session_state.profile is None:
-        refresh_profile()
-
-    show_main_app()
