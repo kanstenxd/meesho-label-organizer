@@ -66,6 +66,8 @@ DEFAULT_SESSION_STATE = {
     "profile": None,
     "current_page": "Dashboard",
     "batch_results": None,
+    # Changing this nonce resets Streamlit's file uploader without a browser refresh.
+    "pdf_uploader_nonce": 0,
     "auth_restored": False,
     "auth_restore_attempts": 0,
     "auth_restore_pending": False,
@@ -2703,6 +2705,29 @@ def show_sku_mappings():
 # PDF ORGANIZER PAGE
 # ============================================================
 
+def clear_current_pdf_batch():
+    """Clear the current extracted PDF batch while keeping the user on this page."""
+    st.session_state.batch_results = None
+
+    # Remove widget state created for the current review batch. This prevents
+    # old selectbox/text-input values from leaking into the next PDF upload.
+    widget_prefixes = (
+        "review_master_",
+        "assign_review_",
+        "new_master_",
+        "create_assign_",
+    )
+    for key in list(st.session_state.keys()):
+        if key.startswith(widget_prefixes):
+            del st.session_state[key]
+
+    # File uploaders cannot be directly cleared through session_state. Giving
+    # the uploader a new key removes the selected files on the next rerun.
+    st.session_state.pdf_uploader_nonce = (
+        st.session_state.get("pdf_uploader_nonce", 0) + 1
+    )
+
+
 def show_pdf_organizer():
     st.title("📄 PDF Label Organizer")
 
@@ -2748,7 +2773,27 @@ def show_pdf_organizer():
         "Upload Meesho Label PDFs",
         type=["pdf"],
         accept_multiple_files=True,
+        key=f"pdf_uploader_{st.session_state.get('pdf_uploader_nonce', 0)}",
     )
+
+    # Keep the clear button at the top of the PDF Organizer so the user can
+    # restart immediately without scrolling through extracted results.
+    if st.session_state.get("batch_results"):
+        clear_button_col, clear_info_col = st.columns([1, 3])
+        with clear_button_col:
+            if st.button(
+                "🗑️ Clear Extracted Data",
+                key="clear_extracted_pdf_data_top",
+                type="secondary",
+                use_container_width=True,
+            ):
+                clear_current_pdf_batch()
+                st.rerun()
+        with clear_info_col:
+            st.caption(
+                "Clear the current extracted PDF data and start a new upload. "
+                "Saved Master Products, SKU mappings, and inventory are not deleted."
+            )
 
     if uploaded_files and st.button(
         "🚀 Extract, Map & Organize Labels",
