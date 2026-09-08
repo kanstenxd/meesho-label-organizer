@@ -6,6 +6,7 @@ import re
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 import extra_streamlit_components as stx
+import time
 
 st.set_page_config(
     page_title="Meesho Label Organizer",
@@ -46,9 +47,22 @@ def get_supabase():
 
 
 def get_cookie_manager():
-    # CookieManager is a Streamlit component. Give it one stable key so the
-    # browser component keeps the same identity across normal reruns/refreshes.
-    return stx.CookieManager(key=COOKIE_MANAGER_KEY)
+    """Create CookieManager only once per Streamlit browser session.
+
+    Creating a new CookieManager on every Streamlit rerun can cause the
+    component's initial empty value to overwrite the real browser cookies.
+    Keeping the same instance in session_state prevents that refresh/logout
+    race.
+    """
+    if "_meesho_cookie_manager" not in st.session_state:
+        st.session_state["_meesho_cookie_manager"] = stx.CookieManager(
+            key=COOKIE_MANAGER_KEY
+        )
+        st.session_state["_meesho_cookie_manager_created"] = True
+    else:
+        st.session_state["_meesho_cookie_manager_created"] = False
+
+    return st.session_state["_meesho_cookie_manager"]
 
 
 supabase: Client = get_supabase()
@@ -167,28 +181,13 @@ def get_response_user(response):
     return None
 
 
-def _cookie_manager_ready():
-    """Return True only after the browser CookieManager has finished loading."""
-    try:
-        ready = getattr(cookie_manager, "ready", None)
-        if callable(ready):
-            return bool(ready())
-        # Compatibility fallback for older package versions.
-        return True
-    except Exception:
-        return False
-
-
 def _get_cookie_tokens():
-    """Read authentication tokens only after CookieManager is ready."""
+    """Read the saved authentication cookies safely."""
     try:
-        cookies = cookie_manager.get_all()
+        cookies = cookie_manager.get_all(key="meesho_auth_cookie_read")
         if not isinstance(cookies, dict):
             return None, None
-        return (
-            cookies.get(COOKIE_ACCESS),
-            cookies.get(COOKIE_REFRESH),
-        )
+        return cookies.get(COOKIE_ACCESS), cookies.get(COOKIE_REFRESH)
     except Exception:
         return None, None
 
@@ -212,25 +211,32 @@ def _get_response_session(response):
 def restore_login_from_cookie():
     """Restore the saved Supabase login after a browser refresh.
 
-    The crucial rule here is that an unready CookieManager is NOT the same as
-    a missing login. We wait for the component to finish loading and never
-    delete cookies from this function. Cookies are deleted only by logout().
+    A brand-new CookieManager initially reports an empty dictionary before its
+    browser component sends the actual cookies back to Streamlit. That empty
+    first value must never be treated as a logout. We wait for one component
+    round-trip, then read the persistent cookies from the same manager instance.
     """
     if st.session_state.get("user") is not None:
         st.session_state.auth_restored = True
         st.session_state.auth_restore_pending = False
+        st.session_state["_meesho_cookie_restore_attempts"] = 0
         return True
 
-    # On a hard refresh the component is asynchronous. Do not use forced
-    # rerun/sleep loops here; those loops can continuously restart the component
-    # before it has a chance to return the browser cookies.
-    if not _cookie_manager_ready():
+    # Do not interpret the CookieManager's initial default value as a missing
+    # login. The component performs one browser round-trip after construction.
+    if st.session_state.get("_meesho_cookie_manager_created", False):
         st.session_state.auth_restore_pending = True
         return None
 
     access_token, refresh_token = _get_cookie_tokens()
 
-    # The component is ready and there is genuinely no saved login.
+    # If get_all is still returning the component's temporary initial value,
+    # allow one additional Streamlit component cycle before showing Login.
+    if not st.session_state.get("_meesho_cookie_read_once", False):
+        st.session_state["_meesho_cookie_read_once"] = True
+        st.session_state.auth_restore_pending = True
+        return None
+
     if not access_token or not refresh_token:
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
@@ -253,22 +259,19 @@ def restore_login_from_cookie():
             st.session_state.auth_restored = True
             st.session_state.auth_restore_pending = False
             st.session_state.auth_restore_attempts = 0
-
-            # Supabase can rotate tokens while restoring the session.
+            st.session_state["_meesho_cookie_restore_attempts"] = 0
             if session:
                 save_auth_session(session)
-
             return True
 
-        # Do not erase the browser cookies automatically. A real logout is the
-        # only code path allowed to clear them.
+        # Never delete persistent cookies here. Only logout() is allowed to
+        # clear them.
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
 
     except Exception:
-        # Network/Supabase errors must never trigger an automatic logout or
-        # cookie deletion. Keep the saved browser session intact.
+        # A temporary network/API error must not become a forced logout.
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
@@ -472,6 +475,7 @@ def login_user(email, password):
 
         st.session_state.user = user
         st.session_state.auth_restored = True
+        st.session_state["_meesho_cookie_read_once"] = True
 
         if session:
             save_auth_session(session)
@@ -527,6 +531,7 @@ def register_user(company_name, email, password):
         if session:
             st.session_state.user = user
             st.session_state.auth_restored = True
+            st.session_state["_meesho_cookie_read_once"] = True
             save_auth_session(session)
             refresh_profile()
             st.success("Account created successfully!")
@@ -568,6 +573,8 @@ def logout():
     st.session_state.auth_restored = False
     st.session_state.auth_restore_attempts = 0
     st.session_state.auth_restore_pending = False
+    st.session_state["_meesho_cookie_read_once"] = True
+    st.session_state["_meesho_cookie_restore_attempts"] = 0
 
     st.rerun()
 
@@ -2892,7 +2899,18 @@ if st.session_state.user is None:
     # "Restoring your login session" loop seen on refresh.
     if restored is None:
         st.info("Restoring your login session…")
-        st.stop()
+        # CookieManager needs a short initial component round-trip. Retry only
+        # a small, fixed number of times; unlike the previous code this can
+        # never become an endless restore loop.
+        attempts = int(st.session_state.get("_meesho_cookie_restore_attempts", 0))
+        if attempts < 2:
+            st.session_state["_meesho_cookie_restore_attempts"] = attempts + 1
+            time.sleep(0.35)
+            st.rerun()
+        # If a component fails to respond after the bounded bootstrap, continue
+        # to the login page rather than leaving the user stuck forever.
+        st.session_state.auth_restore_pending = False
+        st.session_state.auth_restored = True
 
 if st.session_state.user is None:
     show_auth_page()
