@@ -130,9 +130,9 @@ def format_datetime(value):
 def clear_auth_cookies():
     """Cookies are cleared only by an explicit user logout."""
     try:
-        cookie_manager.delete(COOKIE_ACCESS)
-        cookie_manager.delete(COOKIE_REFRESH)
-        cookie_manager.delete(COOKIE_LOGIN_MARKER)
+        cookie_manager.delete(COOKIE_ACCESS, key="delete_meesho_access")
+        cookie_manager.delete(COOKIE_REFRESH, key="delete_meesho_refresh")
+        cookie_manager.delete(COOKIE_LOGIN_MARKER, key="delete_meesho_marker")
     except Exception:
         pass
 
@@ -148,10 +148,23 @@ def save_auth_session(session):
         refresh_token = getattr(session, "refresh_token", None)
         user = getattr(session, "user", None)
 
+        # IMPORTANT: every CookieManager command needs its own component key.
+        # Reusing the default key for several set() calls in one Streamlit run
+        # can cause only one cookie command to reach the browser.
         if access_token:
-            cookie_manager.set(COOKIE_ACCESS, str(access_token), expires_at=expires_at)
+            cookie_manager.set(
+                COOKIE_ACCESS,
+                str(access_token),
+                expires_at=expires_at,
+                key="set_meesho_access",
+            )
         if refresh_token:
-            cookie_manager.set(COOKIE_REFRESH, str(refresh_token), expires_at=expires_at)
+            cookie_manager.set(
+                COOKIE_REFRESH,
+                str(refresh_token),
+                expires_at=expires_at,
+                key="set_meesho_refresh",
+            )
 
         # This marker lets the app distinguish a returning user whose browser
         # cookies are still loading from a genuinely new visitor.
@@ -160,6 +173,7 @@ def save_auth_session(session):
                 COOKIE_LOGIN_MARKER,
                 str(user.id),
                 expires_at=expires_at,
+                key="set_meesho_marker",
             )
     except Exception:
         # Never treat a temporary CookieManager issue as a logout.
@@ -185,7 +199,8 @@ def get_response_user(response):
 def _get_cookie_auth():
     """Read authentication cookies without mistaking component startup for logout."""
     try:
-        cookies = cookie_manager.get_all()
+        # Use a stable, explicit key for the read component as well.
+        cookies = cookie_manager.get_all(key="read_meesho_auth_cookies")
         if cookies is None:
             return None, None, None, False, False
         if not isinstance(cookies, dict):
@@ -516,7 +531,12 @@ def login_user(email, password):
             # Keep a login marker even if the auth response does not expose
             # the session object in this client version.
             try:
-                cookie_manager.set(COOKIE_LOGIN_MARKER, str(user.id), expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS))
+                cookie_manager.set(
+                    COOKIE_LOGIN_MARKER,
+                    str(user.id),
+                    expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS),
+                    key="set_meesho_marker",
+                )
             except Exception:
                 pass
 
@@ -2978,13 +2998,20 @@ if st.session_state.user is None:
     restored = restore_login_from_cookie()
 
     if restored is None:
-        # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
-        # frontend component needs this run to remain alive long enough to read
-        # the browser cookies and send its value back to Streamlit. Repeated
-        # forced reruns can restart the component before it finishes, causing
-        # the endless "Restoring your login session" -> logout cycle.
+        # CookieManager may need a few browser round-trips after a hard refresh.
+        # Do not wait forever: retry a small number of times, and never clear
+        # authentication cookies or call logout during this process.
+        attempts = int(st.session_state.get("auth_restore_attempts", 0))
         st.info("Restoring your login session…")
-        st.stop()
+
+        if attempts < 6:
+            time.sleep(0.35)
+            st.rerun()
+
+        # The browser component still has not returned a usable result. Continue
+        # to the normal login screen instead of leaving the app permanently stuck.
+        # This is NOT a logout and does not delete any saved browser cookies.
+        st.session_state.auth_restore_pending = False
 
 if st.session_state.user is None:
     show_auth_page()
