@@ -3469,76 +3469,119 @@ def show_inventory():
         )
         return
 
-    for product in inventory:
-        product_id = product["id"]
+    # Streamlit's selectbox supports searching by typing, making it much easier
+    # to manage inventory when the company has a large number of Master Products.
+    inventory = sorted(
+        inventory,
+        key=lambda product: str(
+            product.get("product_name") or ""
+        ).lower(),
+    )
 
-        name = (
-            product.get("product_name")
-            or "Unnamed Product"
+    product_options = {
+        str(product.get("product_name") or "Unnamed Product"): product
+        for product in inventory
+    }
+
+    # Protect against duplicate Master Product names so every dropdown option
+    # still points to the correct database record.
+    if len(product_options) != len(inventory):
+        product_options = {}
+        for product in inventory:
+            product_id = str(product.get("id") or "")
+            product_name = str(
+                product.get("product_name") or "Unnamed Product"
+            )
+            label = f"{product_name} — {product_id[:8]}"
+            product_options[label] = product
+
+    selected_product_name = st.selectbox(
+        "🔎 Search or Select a Master Product",
+        options=list(product_options.keys()),
+        index=None,
+        placeholder="Type a Master Product name to search...",
+        key="inventory_master_product_search",
+    )
+
+    if not selected_product_name:
+        st.info(
+            "Search for and select a Master Product to view or update its stock."
+        )
+        return
+
+    product = product_options[selected_product_name]
+    product_id = product["id"]
+    name = (
+        product.get("product_name")
+        or "Unnamed Product"
+    )
+
+    current_quantity = int(
+        product.get("inventory_quantity", 0) or 0
+    )
+
+    minimum_stock = int(
+        product.get("minimum_stock", 0) or 0
+    )
+
+    st.subheader(f"📦 {name}")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        new_quantity = st.number_input(
+            "Current Quantity",
+            min_value=0,
+            value=current_quantity,
+            step=1,
+            key=f"inventory_quantity_{product_id}",
         )
 
-        current_quantity = int(
-            product.get("inventory_quantity", 0) or 0
+    with col2:
+        new_minimum = st.number_input(
+            "Minimum Stock Limit",
+            min_value=0,
+            value=minimum_stock,
+            step=1,
+            key=f"inventory_minimum_{product_id}",
         )
 
-        minimum_stock = int(
-            product.get("minimum_stock", 0) or 0
-        )
-
-        with st.expander(
-            f"📦 {name}",
-            expanded=False,
-        ):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                new_quantity = st.number_input(
-                    "Current Quantity",
-                    min_value=0,
-                    value=current_quantity,
-                    step=1,
-                    key=f"inventory_quantity_{product_id}",
+    if st.button(
+        "💾 Save Inventory Changes",
+        key=f"save_inventory_{product_id}",
+        type="primary",
+    ):
+        try:
+            (
+                supabase.table("master_products")
+                .update(
+                    {
+                        "inventory_quantity": int(new_quantity),
+                        "minimum_stock": int(new_minimum),
+                    }
                 )
-
-            with col2:
-                new_minimum = st.number_input(
-                    "Minimum Stock Limit",
-                    min_value=0,
-                    value=minimum_stock,
-                    step=1,
-                    key=f"inventory_minimum_{product_id}",
+                .eq("id", product_id)
+                .eq(
+                    "company_id",
+                    get_company_id(),
                 )
+                .execute()
+            )
 
-            if st.button(
-                "💾 Save Inventory Changes",
-                key=f"save_inventory_{product_id}",
-            ):
-                try:
-                    (
-                        supabase.table("master_products")
-                        .update(
-                            {
-                                "inventory_quantity": int(new_quantity),
-                                "minimum_stock": int(new_minimum),
-                            }
-                        )
-                        .eq("id", product_id)
-                        .eq(
-                            "company_id",
-                            get_company_id(),
-                        )
-                        .execute()
-                    )
+            # Clear the cached inventory so the newly saved values are shown
+            # immediately without a manual browser refresh.
+            invalidate_inventory_cache()
+            get_inventory(force_refresh=True)
 
-                    st.success(
-                        "Inventory updated successfully!"
-                    )
-                    st.rerun()
+            st.success(
+                f"Inventory for '{name}' updated successfully!"
+            )
+            st.rerun()
 
-                except Exception as e:
-                    st.error(
-                        f"Could not update inventory: {e}"
-                    )
+        except Exception as e:
+            st.error(
+                f"Could not update inventory: {e}"
+            )
 
 
 # ============================================================
