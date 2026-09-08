@@ -862,7 +862,12 @@ def invalidate_subscription_cache():
     st.session_state.subscription_cache_user_id = None
     st.session_state.subscription_cache_loaded_at = None
 
-def get_inventory():
+def get_inventory(force_refresh=False):
+    """Load the company's Master Products, optionally bypassing the UI cache.
+
+    ``force_refresh`` is used immediately after a product is created, edited or
+    deleted so the current Streamlit page can show the database's newest state without requiring the user to manually refresh the browser.
+    """
     company_id = get_company_id()
 
     if not company_id:
@@ -879,7 +884,8 @@ def get_inventory():
     )
 
     if (
-        cached_inventory is not None
+        not force_refresh
+        and cached_inventory is not None
         and cached_company_id == company_id
         and cached_at is not None
         and time.time() - float(cached_at)
@@ -2000,6 +2006,67 @@ def reorganize_pdfs(uploaded_files):
     }
 
 
+def refresh_batch_master_product_choices(
+    results,
+    newly_created_product=None,
+):
+    """Refresh Master Product choices without losing the extracted PDF batch.
+
+    Streamlit reruns the script after a button click, but ``batch_results`` is
+    deliberately kept in session state. This helper reloads Master Products
+    from Supabase and updates every still-open review item in the current batch
+    so a product created moments ago is immediately available for assignment.
+    """
+    fresh_products = get_inventory(force_refresh=True)
+    fresh_names = [
+        get_master_product_name(product)
+        for product in fresh_products
+        if get_master_product_name(product)
+    ]
+
+    # Preserve exact database spelling while preventing duplicate choices.
+    seen = set()
+    fresh_names = [
+        name for name in fresh_names
+        if not (
+            normalize_text(name) in seen
+            or seen.add(normalize_text(name))
+        )
+    ]
+
+    if newly_created_product:
+        new_name = str(newly_created_product).strip()
+        if (
+            new_name
+            and normalize_text(new_name)
+            not in {normalize_text(name) for name in fresh_names}
+        ):
+            fresh_names.append(new_name)
+
+    for review in results.get("review_candidates", {}).values():
+        existing_candidates = review.get("candidates", []) or []
+        existing_by_name = {
+            normalize_text(str(candidate.get("name", ""))): candidate
+            for candidate in existing_candidates
+            if candidate.get("name")
+        }
+
+        refreshed_candidates = list(existing_candidates)
+        for name in fresh_names:
+            key = normalize_text(name)
+            if key not in existing_by_name:
+                # A newly created product has no similarity score until the
+                # next extraction. It is still a valid manual assignment and
+                # must therefore appear immediately in the current list.
+                refreshed_candidates.append(
+                    {"name": name, "score": 0.0}
+                )
+
+        review["candidates"] = refreshed_candidates
+
+    return results
+
+
 def apply_review_assignment(
     results,
     sku,
@@ -2880,6 +2947,9 @@ def show_pdf_organizer():
                             selected_master,
                             "User-approved similar match",
                         ):
+                            refresh_batch_master_product_choices(
+                                results
+                            )
                             st.success(
                                 f"'{sku}' was assigned to "
                                 f"'{selected_master}'."
@@ -2930,6 +3000,23 @@ def show_pdf_organizer():
                                     )
                                     continue
 
+                                # Reload the Master Product list immediately
+                                # while keeping the current extracted PDF batch
+                                # in session state. The new product is added to
+                                # every remaining assignment dropdown before
+                                # this page reruns.
+                                refresh_batch_master_product_choices(
+                                    results,
+                                    new_master_name,
+                                )
+                            else:
+                                # The product already existed; still refresh
+                                # the current batch choices in case another
+                                # tab/session changed the Master Product list.
+                                refresh_batch_master_product_choices(
+                                    results
+                                )
+
                             if apply_review_assignment(
                                 results,
                                 sku,
@@ -2939,10 +3026,18 @@ def show_pdf_organizer():
                                     "and assigned"
                                 ),
                             ):
+                                refresh_batch_master_product_choices(
+                                    results,
+                                    new_master_name,
+                                )
                                 st.success(
                                     f"Created/used '{new_master_name}' "
                                     f"and assigned '{sku}'."
                                 )
+                                # Store the fully updated batch before the
+                                # Streamlit rerun. The extracted PDF data,
+                                # review state and newly created Master Product
+                                # therefore remain on the same page.
                                 st.session_state.batch_results = results
                                 st.rerun()
 
