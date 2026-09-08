@@ -110,6 +110,29 @@ def get_current_user_id():
     return getattr(user, "id", None) if user else None
 
 
+def sync_supabase_auth_from_cookie():
+    """Ensure the newly created Supabase client is authenticated on every rerun.
+
+    Streamlit recreates the Python script on every interaction. The global
+    Supabase client is therefore recreated too, while Streamlit session_state
+    may still contain the logged-in user. Without restoring the access and
+    refresh tokens into the new client, auth.uid() is NULL in database requests
+    and RLS-protected INSERT/UPDATE/DELETE operations fail with error 42501.
+    """
+    if st.session_state.get("user") is None:
+        return False
+
+    access_token, refresh_token, _marker, _has_cookie, _ready = _get_cookie_auth()
+    if not access_token or not refresh_token:
+        return False
+
+    try:
+        supabase.auth.set_session(access_token, refresh_token)
+        return True
+    except Exception:
+        return False
+
+
 def get_current_email():
     user = st.session_state.get("user")
     return str(getattr(user, "email", "") or "").strip().lower()
@@ -1107,7 +1130,27 @@ def save_sku_mapping(sku, master_product_name):
 
     has_user_id = _sku_mappings_has_user_id()
 
+    # IMPORTANT: the Supabase client itself must carry the authenticated JWT on
+    # this Streamlit rerun. session_state.user alone is not enough for RLS.
+    if not sync_supabase_auth_from_cookie():
+        st.error(
+            "Could not save SKU mapping because the authenticated database "
+            "session could not be restored. Please refresh once and try again."
+        )
+        return False
+
     try:
+        # Verify the JWT user and use that exact ID in the row checked by RLS.
+        auth_response = supabase.auth.get_user()
+        auth_user = get_response_user(auth_response)
+        auth_user_id = getattr(auth_user, "id", None)
+        if not auth_user_id:
+            st.error("Could not save SKU mapping: Supabase authentication is not active.")
+            return False
+        if str(auth_user_id) != str(user_id):
+            st.session_state.user = auth_user
+            user_id = auth_user_id
+
         query = supabase.table("sku_mappings").select("id").eq(sku_column, sku).limit(1)
         if has_user_id:
             query = query.eq("user_id", user_id)
@@ -1149,14 +1192,22 @@ def save_sku_mapping(sku, master_product_name):
         return False
 
 def delete_sku_mapping(mapping_id):
+    user_id = get_current_user_id()
+    if not user_id:
+        st.error("Could not delete SKU mapping: your login session could not be verified.")
+        return False
+
+    if not sync_supabase_auth_from_cookie():
+        st.error("Could not delete SKU mapping because the database session is not authenticated.")
+        return False
+
     try:
-        (
-            supabase.table("sku_mappings")
-            .delete()
-            .eq("id", mapping_id)
-            .eq("company_id", get_company_id())
-            .execute()
-        )
+        query = supabase.table("sku_mappings").delete().eq("id", mapping_id)
+        if _sku_mappings_has_user_id():
+            query = query.eq("user_id", user_id)
+        else:
+            query = query.eq("company_id", get_company_id())
+        query.execute()
         return True
     except Exception as e:
         st.error(f"Could not delete SKU mapping: {e}")
@@ -2965,6 +3016,11 @@ def show_subscription_page():
 # ============================================================
 
 def show_main_app():
+    # Every Streamlit interaction starts a new script run and recreates the
+    # Supabase client. Reattach the logged-in JWT before any RLS-protected page
+    # performs database work.
+    sync_supabase_auth_from_cookie()
+
     profile = st.session_state.get("profile") or {}
 
     company_name = (
@@ -3077,6 +3133,10 @@ else:
             st.stop()
 
     if st.session_state.get("user") is not None:
+        # Restore the authenticated JWT into this run's Supabase client before
+        # any profile or application database request is made.
+        sync_supabase_auth_from_cookie()
+
         if st.session_state.get("profile") is None:
             refresh_profile()
 
