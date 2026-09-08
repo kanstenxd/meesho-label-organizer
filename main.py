@@ -2769,31 +2769,31 @@ def show_pdf_organizer():
             )
             return
 
+    # Always keep the clear button visible at the top of the PDF Organizer.
+    # It must not depend on batch_results, otherwise it disappears after the
+    # current batch is cleared and a new PDF is selected.
+    clear_button_col, clear_info_col = st.columns([1, 3])
+    with clear_button_col:
+        if st.button(
+            "🗑️ Clear & Start Over",
+            key="clear_extracted_pdf_data_top",
+            type="secondary",
+            use_container_width=True,
+        ):
+            clear_current_pdf_batch()
+            st.rerun()
+    with clear_info_col:
+        st.caption(
+            "Clear the current upload and all extracted PDF data without leaving "
+            "this page. Saved Master Products, SKU mappings, and inventory are not deleted."
+        )
+
     uploaded_files = st.file_uploader(
         "Upload Meesho Label PDFs",
         type=["pdf"],
         accept_multiple_files=True,
         key=f"pdf_uploader_{st.session_state.get('pdf_uploader_nonce', 0)}",
     )
-
-    # Keep the clear button at the top of the PDF Organizer so the user can
-    # restart immediately without scrolling through extracted results.
-    if st.session_state.get("batch_results"):
-        clear_button_col, clear_info_col = st.columns([1, 3])
-        with clear_button_col:
-            if st.button(
-                "🗑️ Clear Extracted Data",
-                key="clear_extracted_pdf_data_top",
-                type="secondary",
-                use_container_width=True,
-            ):
-                clear_current_pdf_batch()
-                st.rerun()
-        with clear_info_col:
-            st.caption(
-                "Clear the current extracted PDF data and start a new upload. "
-                "Saved Master Products, SKU mappings, and inventory are not deleted."
-            )
 
     if uploaded_files and st.button(
         "🚀 Extract, Map & Organize Labels",
