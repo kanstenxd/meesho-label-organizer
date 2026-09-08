@@ -1209,12 +1209,15 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
-    """Load and fully resolve every saved SKU → Master Product mapping.
+    """Load every accessible saved exact SKU -> Master Product mapping.
 
-    A mapping table can store either a Master Product name or a
-    ``master_product_id``. The UI and PDF matcher must always receive the
-    actual Master Product name, so ID-based mappings are resolved against the
-    current company's master_products before they are returned.
+    Mappings are remembered by the *literal extracted SKU text*.  We deliberately
+    do not lowercase, trim, or otherwise normalize the SKU because capitalization,
+    spaces, hyphens and underscores are significant for automatic reuse.
+
+    Older versions of this application have stored mappings using either
+    ``user_id`` or ``company_id`` ownership.  To keep previously approved
+    mappings working, both ownership scopes are loaded and merged when available.
     """
     company_id = get_company_id()
     user_id = get_current_user_id()
@@ -1225,20 +1228,48 @@ def get_user_mappings():
         return []
 
     try:
-        query = supabase.table("sku_mappings").select("*")
-        # Prefer user ownership when that column exists. If an older mapping
-        # row is company-owned, a second company query below can still recover
-        # it instead of making an already-approved SKU disappear.
-        if _sku_mappings_has_user_id() and user_id:
-            query = query.eq("user_id", user_id)
-        elif company_id:
-            query = query.eq("company_id", company_id)
+        rows = []
+        seen_row_ids = set()
 
-        rows = list(query.execute().data or [])
+        def add_rows(query):
+            try:
+                for raw in list(query.execute().data or []):
+                    row_id = raw.get("id") if isinstance(raw, dict) else None
+                    marker = str(row_id) if row_id not in (None, "") else repr(raw)
+                    if marker not in seen_row_ids:
+                        seen_row_ids.add(marker)
+                        rows.append(dict(raw or {}))
+            except Exception:
+                # A schema/RLS configuration can make one ownership filter
+                # unavailable. The other query can still recover valid rows.
+                pass
 
-        # Build ID → name lookup once. This is the critical step for schemas
-        # whose sku_mappings table stores master_product_id.
-        inventory = get_inventory()
+        has_user_id = _sku_mappings_has_user_id()
+
+        if has_user_id and user_id:
+            add_rows(
+                supabase.table("sku_mappings")
+                .select("*")
+                .eq("user_id", user_id)
+            )
+
+        if company_id:
+            add_rows(
+                supabase.table("sku_mappings")
+                .select("*")
+                .eq("company_id", company_id)
+            )
+
+        # Last-resort query for installations whose table does not expose the
+        # expected ownership columns through the client schema.
+        if not rows:
+            add_rows(supabase.table("sku_mappings").select("*"))
+
+        # Always use a fresh Master Product lookup while resolving mappings.
+        # This prevents a recently created product from leaving an otherwise
+        # valid master_product_id mapping unresolved because of the short UI
+        # inventory cache.
+        inventory = get_inventory(force_refresh=True)
         product_id_to_name = {
             str(product.get("id")): get_master_product_name(product)
             for product in inventory
@@ -1273,8 +1304,6 @@ def get_user_mappings():
             if not master_name and master_id not in (None, ""):
                 master_name = product_id_to_name.get(str(master_id), "")
 
-            # If the product was not included in the initial inventory lookup,
-            # make one direct lookup before treating the mapping as unresolved.
             if not master_name and master_id not in (None, ""):
                 try:
                     product_query = (
@@ -1293,24 +1322,25 @@ def get_user_mappings():
                 except Exception:
                     pass
 
+            # Preserve the stored SKU literally. Do not strip it: the exact
+            # character sequence is the key for remembered mappings.
             row["sku"] = str(sku or "")
             row["master_product_name"] = str(master_name or "").strip()
             row["master_product_id"] = master_id
 
-            if row["sku"]:
+            if row["sku"] and row["master_product_name"]:
                 mappings.append(row)
 
-        # Keep the newest usable mapping for every exact SKU string. A usable
-        # resolved Master Product always wins over an older broken/empty row.
+        # One usable mapping per literal SKU. Prefer the newest mapping while
+        # retaining exact character-sensitive matching.
         deduplicated = {}
         for mapping in mappings:
             key = normalize_sku_key(mapping.get("sku"))
-            if not key:
+            if key == "":
                 continue
             previous = deduplicated.get(key)
             if (
                 previous is None
-                or (not previous.get("master_product_name") and mapping.get("master_product_name"))
                 or str(mapping.get("created_at", "")) >= str(previous.get("created_at", ""))
             ):
                 deduplicated[key] = mapping
@@ -1742,8 +1772,9 @@ def find_matching_master_product(
        the best possible Master Product suggestions and wait for the user's
        decision.
     3. Once the user explicitly assigns a SKU to a Master Product, that exact
-       normalized SKU mapping is saved and will be reused automatically in
-       future uploads. Matching ignores case, underscores and hyphens.
+       literal SKU mapping is saved and will be reused automatically in
+       future uploads. Capitalization, spaces, underscores and hyphens remain
+       significant.
     """
     sku = str(extracted.get("sku", "") or "")
     sku_norm = normalize_sku_key(sku)
@@ -1862,7 +1893,7 @@ def reorganize_pdfs(uploaded_files):
     # the authenticated Supabase session on this Streamlit rerun.
     sync_supabase_auth_from_cookie()
     mappings = get_user_mappings()
-    master_products = get_inventory()
+    master_products = get_inventory(force_refresh=True)
 
     categorized_pages = {}
     uncategorized_pages = []
