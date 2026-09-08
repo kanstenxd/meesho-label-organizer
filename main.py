@@ -72,6 +72,11 @@ DEFAULT_SESSION_STATE = {
     "auth_cookie_seen": False,
     "auth_component_ready": False,
     "auth_restore_generation": 0,
+    # CookieManager can briefly report an empty dictionary immediately after a
+    # browser refresh even when authentication cookies still exist. This flag
+    # lets us wait for one component update before deciding the visitor is
+    # actually logged out.
+    "auth_cookie_checked_once": False,
     "logout_requested": False,
 }
 
@@ -188,19 +193,38 @@ def _get_cookie_auth():
     """Read authentication cookies without mistaking component startup for logout."""
     try:
         cookies = cookie_manager.get_all()
-        if cookies is None:
-            return None, None, None, False, False
-        if not isinstance(cookies, dict):
+
+        # The CookieManager frontend loads asynchronously after a full browser
+        # refresh. None or a non-dict value means it has not answered yet.
+        if cookies is None or not isinstance(cookies, dict):
             return None, None, None, False, False
 
-        # CookieManager returns an empty dict while its frontend component is
-        # still starting on some Streamlit refreshes. Do not treat that as a
-        # confirmed logout.
+        # On some refreshes the first frontend response is simply {} even though
+        # the browser still contains the authentication cookies. Wait for one
+        # component update before treating an empty result as a real logout.
+        if not cookies and not st.session_state.get(
+            "auth_cookie_checked_once", False
+        ):
+            st.session_state.auth_cookie_checked_once = True
+            return None, None, None, False, False
+
+        st.session_state.auth_cookie_checked_once = True
+
         access_token = cookies.get(COOKIE_ACCESS)
         refresh_token = cookies.get(COOKIE_REFRESH)
         marker = cookies.get(COOKIE_LOGIN_MARKER)
-        has_any_auth_cookie = bool(access_token or refresh_token or marker)
-        return access_token, refresh_token, marker, has_any_auth_cookie, True
+        has_any_auth_cookie = bool(
+            access_token or refresh_token or marker
+        )
+
+        return (
+            access_token,
+            refresh_token,
+            marker,
+            has_any_auth_cookie,
+            True,
+        )
+
     except Exception:
         return None, None, None, False, False
 
@@ -211,11 +235,16 @@ def _get_response_session(response):
             return response.session
     except Exception:
         pass
+
     try:
-        if hasattr(response, "data") and getattr(response.data, "session", None):
+        if (
+            hasattr(response, "data")
+            and getattr(response.data, "session", None)
+        ):
             return response.data.session
     except Exception:
         pass
+
     return None
 
 
@@ -226,30 +255,43 @@ def restore_login_from_cookie():
         st.session_state.auth_restore_pending = False
         return True
 
-    access_token, refresh_token, marker, has_auth_cookie, component_ready = _get_cookie_auth()
+    (
+        access_token,
+        refresh_token,
+        marker,
+        has_auth_cookie,
+        component_ready,
+    ) = _get_cookie_auth()
 
-    # CookieManager has not returned a usable value yet. Stop only in this case.
+    # Do not render the Login/Register screen while CookieManager is still
+    # starting. This prevents the visible "logged out for a moment" flash after
+    # refreshing a valid logged-in session.
     if not component_ready:
         st.session_state.auth_restore_pending = True
         return None
 
     st.session_state.auth_component_ready = True
 
-    # An empty cookie dictionary means this visitor is logged out. Do not wait
-    # for a timer here: Streamlit has no automatic timer rerun, so waiting would
-    # leave the app permanently stuck on “Restoring your login session…”.
+    # At this point CookieManager has completed its startup check. An empty
+    # result now means the visitor is genuinely logged out.
     if not access_token or not refresh_token:
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restored = True
         return False
 
     session = None
+
     try:
-        response = supabase.auth.set_session(access_token, refresh_token)
+        response = supabase.auth.set_session(
+            access_token,
+            refresh_token,
+        )
         session = _get_response_session(response)
     except Exception:
         session = None
 
+    # If the stored access token expired, Supabase may still be able to create a
+    # fresh session from the refresh token.
     if not session:
         try:
             response = supabase.auth.refresh_session()
@@ -284,11 +326,11 @@ def restore_login_from_cookie():
         st.session_state.auth_restore_started_at = None
         return True
 
-    # Invalid or expired tokens should not trap the visitor in a restore loop.
+    # Cookies were present but no valid user could be restored. Treat this as a
+    # completed failed restore instead of looping forever.
     st.session_state.auth_restore_pending = False
     st.session_state.auth_restored = True
     return False
-
 
 # ============================================================
 # PROFILE / COMPANY
@@ -542,6 +584,7 @@ def login_user(email, password):
         st.session_state.auth_restored = True
         st.session_state.auth_restore_pending = False
         st.session_state.auth_restore_started_at = None
+        st.session_state.auth_cookie_checked_once = True
 
         if session:
             save_auth_session(session)
@@ -630,7 +673,7 @@ def logout():
         "user", "profile", "batch_results", "auth_restored",
         "auth_restore_attempts", "auth_restore_pending",
         "auth_restore_started_at", "auth_cookie_seen",
-        "auth_component_ready",
+        "auth_component_ready", "auth_cookie_checked_once",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -2982,22 +3025,28 @@ def show_main_app():
 # APPLICATION START
 # ============================================================
 
-# Explicit logout: never restore an old browser session during the logout run.
+# Explicit logout must never immediately restore an old browser session.
 if st.session_state.get("logout_requested", False):
     show_auth_page()
+
 else:
     if st.session_state.get("user") is None:
         restored = restore_login_from_cookie()
 
+        # CookieManager is still loading after this browser refresh. Stop here
+        # so the frontend component can finish and trigger its normal update.
+        # Most importantly, do not render the Login/Register screen first.
         if restored is None:
-            # Wait for CookieManager/Supabase rather than rendering two pages.
             st.info("Restoring your login session…")
             st.stop()
 
+    # Only show the authentication page after cookie restoration has completed
+    # and confirmed that there is no valid authenticated user.
     if st.session_state.get("user") is None:
         show_auth_page()
+
     else:
         if st.session_state.get("profile") is None:
             refresh_profile()
-        show_main_app()
 
+        show_main_app()
