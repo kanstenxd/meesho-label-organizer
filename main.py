@@ -78,6 +78,11 @@ DEFAULT_SESSION_STATE = {
     # actually logged out.
     "auth_cookie_checked_once": False,
     "logout_requested": False,
+    # Keep the current Supabase session tokens in Streamlit session_state as
+    # the primary source during normal reruns. Browser cookies are only needed
+    # after a full browser refresh/new Streamlit session.
+    "supabase_access_token": None,
+    "supabase_refresh_token": None,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -111,27 +116,63 @@ def get_current_user_id():
 
 
 def sync_supabase_auth_from_cookie():
-    """Ensure the newly created Supabase client is authenticated on every rerun.
+    """Ensure this rerun's Supabase client has the authenticated JWT.
 
-    Streamlit recreates the Python script on every interaction. The global
-    Supabase client is therefore recreated too, while Streamlit session_state
-    may still contain the logged-in user. Without restoring the access and
-    refresh tokens into the new client, auth.uid() is NULL in database requests
-    and RLS-protected INSERT/UPDATE/DELETE operations fail with error 42501.
+    Streamlit reruns recreate the Python-side Supabase client. We therefore
+    restore the session from Streamlit session_state first (fast and reliable
+    during normal interactions), then fall back to browser cookies after a
+    full refresh. This is required for RLS policies using auth.uid().
     """
     if st.session_state.get("user") is None:
         return False
 
-    access_token, refresh_token, _marker, _has_cookie, _ready = _get_cookie_auth()
+    access_token = st.session_state.get("supabase_access_token")
+    refresh_token = st.session_state.get("supabase_refresh_token")
+
+    # After a full browser refresh session_state is new, so read persisted
+    # tokens from the browser cookies.
+    if not access_token or not refresh_token:
+        (
+            access_token,
+            refresh_token,
+            _marker,
+            _has_cookie,
+            _ready,
+        ) = _get_cookie_auth()
+
     if not access_token or not refresh_token:
         return False
 
     try:
-        supabase.auth.set_session(access_token, refresh_token)
+        response = supabase.auth.set_session(
+            access_token,
+            refresh_token,
+        )
+        session = _get_response_session(response)
+
+        # Store the tokens actually accepted/refreshed by Supabase.
+        if session:
+            st.session_state.supabase_access_token = getattr(
+                session, "access_token", access_token
+            ) or access_token
+            st.session_state.supabase_refresh_token = getattr(
+                session, "refresh_token", refresh_token
+            ) or refresh_token
+            save_auth_session(session)
+        else:
+            st.session_state.supabase_access_token = access_token
+            st.session_state.supabase_refresh_token = refresh_token
+
+        # Verify that auth.uid() will be available to RLS.
+        auth_response = supabase.auth.get_user()
+        auth_user = get_response_user(auth_response)
+        if not auth_user:
+            return False
+
+        st.session_state.user = auth_user
         return True
     except Exception:
         return False
-
 
 def get_current_email():
     user = st.session_state.get("user")
@@ -159,6 +200,8 @@ def format_datetime(value):
 
 def clear_auth_cookies():
     """Cookies are cleared only by an explicit user logout."""
+    st.session_state.supabase_access_token = None
+    st.session_state.supabase_refresh_token = None
     try:
         cookie_manager.delete(COOKIE_ACCESS)
         cookie_manager.delete(COOKIE_REFRESH)
@@ -177,6 +220,13 @@ def save_auth_session(session):
         access_token = getattr(session, "access_token", None)
         refresh_token = getattr(session, "refresh_token", None)
         user = getattr(session, "user", None)
+
+        # Make tokens immediately available to later Streamlit reruns even
+        # before the browser CookieManager component reports them back.
+        if access_token:
+            st.session_state.supabase_access_token = str(access_token)
+        if refresh_token:
+            st.session_state.supabase_refresh_token = str(refresh_token)
 
         if access_token:
             cookie_manager.set(COOKIE_ACCESS, str(access_token), expires_at=expires_at)
@@ -1064,18 +1114,23 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
-    """Load mappings belonging to the current authenticated user/company."""
+    """Load all saved mappings visible to the authenticated user.
+
+    Mapping lookup is performed before every PDF organization run, so a
+    manually assigned SKU is immediately reused on later uploads.
+    """
     company_id = get_company_id()
     user_id = get_current_user_id()
     if not company_id and not user_id:
         return []
 
+    # Reads can also be protected by RLS, therefore authenticate this rerun's
+    # Supabase client before querying the mapping table.
+    if not sync_supabase_auth_from_cookie():
+        return []
+
     try:
         query = supabase.table("sku_mappings").select("*")
-
-        # sku_mappings RLS in the current database is based on user_id.  Use
-        # that column when available; this also prevents company_id from
-        # accidentally hiding a user's own mappings.
         if _sku_mappings_has_user_id() and user_id:
             query = query.eq("user_id", user_id)
         elif company_id:
@@ -1084,54 +1139,35 @@ def get_user_mappings():
         response = query.execute()
         sku_column = _get_sku_mapping_sku_column()
         master_column = _get_sku_mapping_master_column()
-        return [_normalize_mapping_row(row, sku_column, master_column) for row in (response.data or [])]
+        mappings = [
+            _normalize_mapping_row(row, sku_column, master_column)
+            for row in (response.data or [])
+        ]
+
+        # De-duplicate by normalized SKU while retaining the newest row order.
+        # This also makes older manually-created duplicate rows harmless.
+        normalized = {}
+        for mapping in mappings:
+            key = normalize_text(mapping.get("sku"))
+            if key:
+                normalized[key] = mapping
+        return list(normalized.values())
     except Exception as e:
         st.error(f"Could not load SKU mappings: {e}")
         return []
 
 def save_sku_mapping(sku, master_product_name):
-    """Save a user-approved SKU mapping.
+    """Create or update a user-approved SKU → Master Product mapping.
 
-    The first-time assignment is always user initiated.  The saved row stores
-    user_id whenever that column exists so Supabase RLS can verify ownership.
+    Existing mappings are matched by normalized SKU, not only literal text, so
+    the same SKU with different punctuation/case cannot create a second row or
+    lose its previous manual assignment.
     """
     sku = str(sku or "").strip()
     master_product_name = str(master_product_name or "").strip()
     if not sku or not master_product_name:
         return False
 
-    company_id = get_company_id()
-    user_id = get_current_user_id()
-    if not user_id:
-        st.error("Could not save SKU mapping: your login session could not be verified.")
-        return False
-
-    sku_column = _get_sku_mapping_sku_column()
-    master_column = _get_sku_mapping_master_column()
-    if not sku_column or not master_column:
-        missing = []
-        if not sku_column:
-            missing.append("SKU")
-        if not master_column:
-            missing.append("Master Product")
-        st.error(
-            "Could not save SKU mapping because the sku_mappings table does not "
-            f"contain a supported {' and '.join(missing)} column."
-        )
-        return False
-
-    master_value = _master_product_value_for_storage(master_column, master_product_name)
-    if master_value in (None, ""):
-        st.error(
-            "Could not save SKU mapping because the selected Master Product "
-            "could not be resolved in the current database schema."
-        )
-        return False
-
-    has_user_id = _sku_mappings_has_user_id()
-
-    # IMPORTANT: the Supabase client itself must carry the authenticated JWT on
-    # this Streamlit rerun. session_state.user alone is not enough for RLS.
     if not sync_supabase_auth_from_cookie():
         st.error(
             "Could not save SKU mapping because the authenticated database "
@@ -1139,31 +1175,64 @@ def save_sku_mapping(sku, master_product_name):
         )
         return False
 
+    user_id = get_current_user_id()
+    company_id = get_company_id()
+    if not user_id:
+        st.error("Could not save SKU mapping: your login session could not be verified.")
+        return False
+
+    sku_column = _get_sku_mapping_sku_column()
+    master_column = _get_sku_mapping_master_column()
+    if not sku_column or not master_column:
+        st.error("Could not save SKU mapping because the sku_mappings schema could not be detected.")
+        return False
+
+    master_value = _master_product_value_for_storage(
+        master_column, master_product_name
+    )
+    if master_value in (None, ""):
+        st.error("Could not resolve the selected Master Product.")
+        return False
+
     try:
-        # Verify the JWT user and use that exact ID in the row checked by RLS.
         auth_response = supabase.auth.get_user()
         auth_user = get_response_user(auth_response)
         auth_user_id = getattr(auth_user, "id", None)
         if not auth_user_id:
             st.error("Could not save SKU mapping: Supabase authentication is not active.")
             return False
-        if str(auth_user_id) != str(user_id):
-            st.session_state.user = auth_user
-            user_id = auth_user_id
 
-        query = supabase.table("sku_mappings").select("id").eq(sku_column, sku).limit(1)
+        user_id = str(auth_user_id)
+        st.session_state.user = auth_user
+        has_user_id = _sku_mappings_has_user_id()
+
+        # Fetch the user's accessible mappings and find an existing row by the
+        # same normalization used during future PDF matching.
+        existing_query = supabase.table("sku_mappings").select("id,*")
         if has_user_id:
-            query = query.eq("user_id", user_id)
+            existing_query = existing_query.eq("user_id", user_id)
         elif company_id:
-            query = query.eq("company_id", company_id)
-        existing = query.execute()
+            existing_query = existing_query.eq("company_id", company_id)
+        existing_rows = existing_query.execute().data or []
 
-        if existing.data:
-            update_data = {master_column: master_value}
+        sku_norm = normalize_text(sku)
+        existing_row = None
+        for row in existing_rows:
+            stored_sku = row.get(sku_column)
+            if normalize_text(stored_sku) == sku_norm:
+                existing_row = row
+                break
+
+        if existing_row:
+            update_data = {
+                master_column: master_value,
+                # Store the latest extracted representation of the SKU.
+                sku_column: sku,
+            }
             (
                 supabase.table("sku_mappings")
                 .update(update_data)
-                .eq("id", existing.data[0]["id"])
+                .eq("id", existing_row["id"])
                 .execute()
             )
         else:
@@ -1173,8 +1242,6 @@ def save_sku_mapping(sku, master_product_name):
             }
             if company_id:
                 insert_data["company_id"] = company_id
-            # This is the important RLS fix.  The database policy checks
-            # user_id = auth.uid(), so omitting user_id causes error 42501.
             if has_user_id:
                 insert_data["user_id"] = user_id
 
@@ -1183,6 +1250,7 @@ def save_sku_mapping(sku, master_product_name):
                 .insert(insert_data)
                 .execute()
             )
+
         return True
     except Exception as e:
         st.session_state.pop("sku_mapping_sku_column", None)
@@ -1603,6 +1671,9 @@ def find_matching_master_product(
 # ============================================================
 
 def reorganize_pdfs(uploaded_files):
+    # Ensure both the mapping read and any later manual assignment run with
+    # the authenticated Supabase session on this Streamlit rerun.
+    sync_supabase_auth_from_cookie()
     mappings = get_user_mappings()
     master_products = get_inventory()
 
