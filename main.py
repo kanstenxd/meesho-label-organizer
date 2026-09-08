@@ -1424,7 +1424,6 @@ def extract_product_section(page_text):
         page_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-
     if match:
         return match.group(1).strip()
 
@@ -1433,18 +1432,203 @@ def extract_product_section(page_text):
         page_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-
     return fallback.group(1).strip() if fallback else ""
 
 
-def parse_product_details(page_text):
-    """Extract SKU, Size, Qty and Color from a Meesho label page safely.
+def _clean_extracted_value(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip(" :-\t\n")
 
-    Meesho PDFs do not always preserve their visual table layout when text is
-    extracted. A common failure mode is reading the header ``SKU Size Qty Color
-    Order No.`` as if ``Order No.`` were the SKU value. This parser searches the
-    whole page for real field/value pairs, explicitly rejects table headers and
-    order metadata, and only then falls back to the older table-style parser.
+
+def _is_invalid_sku(value):
+    value = _clean_extracted_value(value)
+    normalized = value.lower().rstrip(".:").strip()
+    invalid = {
+        "", "sku", "size", "qty", "quantity", "color", "colour",
+        "order no", "order number", "product details", "order details",
+        "tax invoice", "invoice", "page",
+    }
+    if normalized in invalid:
+        return True
+    if re.fullmatch(
+        r"(?:sku|size|qty|quantity|colou?r|order\s*(?:no\.?|number))",
+        normalized,
+        flags=re.I,
+    ):
+        return True
+    return False
+
+
+def _group_page_words_into_lines(words, tolerance=3.5):
+    """Return PyMuPDF words grouped into visual lines by their Y coordinate."""
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (float(w[1]), float(w[0])))
+    lines = []
+    for word in sorted_words:
+        x0, y0, x1, y1, text = word[:5]
+        if not str(text).strip():
+            continue
+        cy = (float(y0) + float(y1)) / 2
+        if lines and abs(cy - lines[-1]["cy"]) <= tolerance:
+            lines[-1]["words"].append((float(x0), float(y0), float(x1), float(y1), str(text)))
+            count = len(lines[-1]["words"])
+            lines[-1]["cy"] = ((lines[-1]["cy"] * (count - 1)) + cy) / count
+        else:
+            lines.append({
+                "cy": cy,
+                "words": [(float(x0), float(y0), float(x1), float(y1), str(text))],
+            })
+    for line in lines:
+        line["words"].sort(key=lambda w: w[0])
+        line["text"] = " ".join(w[4] for w in line["words"]).strip()
+    return lines
+
+
+def _header_positions_from_line(line):
+    """Find SKU / Size / Qty / Color header X positions on one visual line."""
+    positions = {}
+    aliases = {
+        "sku": {"sku"},
+        "size": {"size"},
+        "qty": {"qty", "quantity"},
+        "color": {"color", "colour"},
+    }
+    for x0, _y0, x1, _y1, text in line["words"]:
+        token = re.sub(r"[^a-z]", "", text.lower())
+        for field, names in aliases.items():
+            if token in names and field not in positions:
+                positions[field] = (x0 + x1) / 2
+    return positions
+
+
+def _find_product_table_header(lines):
+    """Locate the most likely visual SKU/Size/Qty/Color header row."""
+    best = None
+    for index, line in enumerate(lines):
+        positions = _header_positions_from_line(line)
+        score = len(positions)
+        if score < 2:
+            continue
+        # A real product table normally contains SKU plus at least one other
+        # product attribute. Prefer rows containing all four headers.
+        if "sku" in positions:
+            score += 2
+        if "qty" in positions:
+            score += 1
+        if best is None or score > best[0]:
+            best = (score, index, positions)
+    return best
+
+
+def _column_bounds(header_positions, page_width):
+    ordered = sorted(header_positions.items(), key=lambda item: item[1])
+    bounds = {}
+    for index, (field, x) in enumerate(ordered):
+        left = 0.0 if index == 0 else (ordered[index - 1][1] + x) / 2
+        right = page_width if index == len(ordered) - 1 else (x + ordered[index + 1][1]) / 2
+        bounds[field] = (left, right)
+    return bounds
+
+
+def _looks_like_section_start(text):
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    return any(marker in normalized for marker in [
+        "order no", "order number", "order details", "tax invoice",
+        "bill to", "ship to", "seller details", "payment details",
+        "purchase order", "invoice no",
+    ])
+
+
+def _extract_visual_table_values(page):
+    """Extract product fields from their actual PDF X/Y positions.
+
+    Plain ``get_text('text')`` does not preserve table columns reliably. This
+    routine uses PyMuPDF word coordinates, finds the SKU/Size/Qty/Color header
+    row and reads the first product row directly underneath each column.
+    """
+    empty = {"sku": "", "size": "", "qty": 1, "color": ""}
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        return empty
+
+    lines = _group_page_words_into_lines(words)
+    header = _find_product_table_header(lines)
+    if not header:
+        return empty
+
+    _score, header_index, positions = header
+    page_width = float(page.rect.width)
+    bounds = _column_bounds(positions, page_width)
+    header_y = lines[header_index]["cy"]
+
+    # Product values can wrap onto two visual lines. Read a compact block below
+    # the header, stopping before order/invoice metadata. Only words inside each
+    # visual column are accepted.
+    collected = {field: [] for field in bounds}
+    data_line_count = 0
+    for line in lines[header_index + 1:]:
+        if line["cy"] - header_y > 130:
+            break
+        text = line["text"]
+        if data_line_count > 0 and _looks_like_section_start(text):
+            break
+        if _looks_like_section_start(text) and not collected.get("sku"):
+            break
+
+        line_values = {field: [] for field in bounds}
+        for x0, _y0, x1, _y1, word in line["words"]:
+            cx = (x0 + x1) / 2
+            for field, (left, right) in bounds.items():
+                if left <= cx < right:
+                    line_values[field].append((x0, word))
+                    break
+
+        if not any(line_values.values()):
+            continue
+
+        # Ignore another repeated header row.
+        normalized_line = text.lower()
+        if sum(token in normalized_line for token in ("sku", "size", "qty", "color", "colour")) >= 3:
+            continue
+
+        for field, values in line_values.items():
+            if values:
+                values.sort(key=lambda item: item[0])
+                collected[field].append(" ".join(word for _, word in values))
+
+        data_line_count += 1
+        # Normally one row is enough. Allow a second line only when the SKU or
+        # another product value appears wrapped and no metadata has begun.
+        if data_line_count >= 2:
+            break
+
+    result = dict(empty)
+    for field, parts in collected.items():
+        if not parts:
+            continue
+        value = _clean_extracted_value(" ".join(parts))
+        if field == "sku":
+            if not _is_invalid_sku(value):
+                result[field] = value
+        elif field == "qty":
+            match = re.search(r"\b(\d+)\b", value)
+            if match:
+                result[field] = max(1, int(match.group(1)))
+        else:
+            result[field] = value
+
+    return result
+
+
+def parse_product_details(page_text, page=None):
+    """Extract SKU, Size, Qty and Color from a Meesho label.
+
+    The parser first uses the PDF's actual word coordinates whenever a PyMuPDF
+    page is supplied. This prevents SKU text from being incorrectly copied into
+    Size or Color when a PDF's plain text extraction loses the table layout.
+    The older text parser remains as a fallback for labels whose table headers
+    cannot be detected.
     """
     result = {
         "sku": "",
@@ -1453,6 +1637,14 @@ def parse_product_details(page_text):
         "color": "",
         "raw_product_details": extract_product_section(page_text),
     }
+
+    if page is not None:
+        visual = _extract_visual_table_values(page)
+        if visual.get("sku"):
+            result.update(visual)
+            # A valid visual table extraction is authoritative. Do not let the
+            # unreliable plain-text order overwrite Size or Color.
+            return result
 
     if not page_text:
         return result
@@ -1467,15 +1659,12 @@ def parse_product_details(page_text):
         "sku", "size", "qty", "quantity", "color", "colour",
         "order no", "order no.", "order number", "product details",
     }
-    invalid_sku_values = {
-        "sku", "size", "qty", "quantity", "color", "colour",
-        "order no", "order no.", "order number", "product details",
+    invalid_sku_values = field_labels | {
         "order details", "tax invoice", "invoice", "page",
     }
 
     def clean_value(value):
-        value = re.sub(r"\s+", " ", str(value or "")).strip(" :-\t")
-        return value
+        return _clean_extracted_value(value)
 
     def is_label_or_metadata(value, for_sku=False):
         value = clean_value(value)
@@ -1488,34 +1677,22 @@ def parse_product_details(page_text):
             return True
         if re.fullmatch(r"(?:order\s*)?(?:no|number)\.?", normalized, flags=re.I):
             return True
-        # A value that is itself only a column heading is never a product SKU.
         if for_sku and re.fullmatch(r"(?:sku|size|qty|quantity|colou?r|order\s*(?:no\.?|number))", normalized, flags=re.I):
             return True
         return False
 
     def line_values_after_label(labels, for_sku=False):
-        """Return every plausible value following a label occurrence."""
         found = []
         normalized_labels = [label.lower() for label in labels]
-
         for index, line in enumerate(raw_lines):
             compact = clean_value(line)
             lower = compact.lower().rstrip(":-").strip()
-
-            # Same-line form: SKU: ABC-123
             for label in normalized_labels:
-                match = re.match(
-                    rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
-                    compact,
-                    flags=re.I,
-                )
+                match = re.match(rf"^{re.escape(label)}\s*[:\-]\s*(.+)$", compact, flags=re.I)
                 if match:
                     value = clean_value(match.group(1))
                     if not is_label_or_metadata(value, for_sku):
                         found.append(value)
-
-            # Label on its own line. Keep looking past consecutive column
-            # headers, but never accept Order No. as a product value.
             if lower in normalized_labels:
                 for next_index in range(index + 1, len(raw_lines)):
                     candidate = clean_value(raw_lines[next_index])
@@ -1526,12 +1703,10 @@ def parse_product_details(page_text):
                         continue
                     found.append(candidate)
                     break
-
         return found
 
     def choose_best(values, for_sku=False):
-        cleaned = []
-        seen = set()
+        cleaned, seen = [], set()
         for value in values:
             value = clean_value(value)
             key = value.lower()
@@ -1539,33 +1714,21 @@ def parse_product_details(page_text):
                 continue
             seen.add(key)
             cleaned.append(value)
-
         if not cleaned:
             return ""
-
-        # Product SKUs are normally more descriptive than a one-word field
-        # value. Prefer values containing letters and multiple characters.
         if for_sku:
             product_like = [
                 value for value in cleaned
-                if re.search(r"[A-Za-z]", value)
-                and not re.fullmatch(r"\d+", value)
+                if re.search(r"[A-Za-z]", value) and not re.fullmatch(r"\d+", value)
             ]
             if product_like:
                 return max(product_like, key=len)
         return cleaned[0]
 
-    result["sku"] = choose_best(
-        line_values_after_label(("SKU",), for_sku=True),
-        for_sku=True,
-    )
-    result["size"] = choose_best(
-        line_values_after_label(("Size",)),
-    )
+    result["sku"] = choose_best(line_values_after_label(("SKU",), for_sku=True), for_sku=True)
+    result["size"] = choose_best(line_values_after_label(("Size",)))
     qty_values = line_values_after_label(("Qty", "Quantity"))
-    result["color"] = choose_best(
-        line_values_after_label(("Color", "Colour")),
-    )
+    result["color"] = choose_best(line_values_after_label(("Color", "Colour")))
 
     for value in qty_values:
         qty_match = re.search(r"\b(\d+)\b", value)
@@ -1573,9 +1736,6 @@ def parse_product_details(page_text):
             result["qty"] = max(1, int(qty_match.group(1)))
             break
 
-    # Text extraction can flatten the table into one line. Search for a SKU
-    # value bounded by another recognised field. This deliberately includes
-    # Order No. as a boundary so it cannot become the SKU value.
     if not result["sku"]:
         flat = "\n".join(raw_lines)
         sku_matches = re.finditer(
@@ -1589,59 +1749,41 @@ def parse_product_details(page_text):
                 result["sku"] = value
                 break
 
-    # Last-resort legacy parser. Use the Product Details block first, then the
-    # whole page, but strip all known headers before interpreting the row.
     if not result["sku"]:
         source = result["raw_product_details"] or page_text
         source = re.sub(
             r"\b(?:Product\s*Details|SKU|Size|Qty|Quantity|Color|Colour|Order\s*(?:No\.?|Number))\b",
-            " ",
-            source,
-            flags=re.I,
+            " ", source, flags=re.I,
         )
         working = re.sub(r"\s+", " ", source).strip()
-
         known_colors = [
-            "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
-            "Dark Blue", "Sky Blue", "Navy Blue", "Bottle Green",
-            "Sea Green", "Off White", "Black", "White", "Red", "Blue",
-            "Green", "Yellow", "Orange", "Pink", "Purple", "Brown",
-            "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
+            "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
+            "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
+            "Black", "White", "Red", "Blue", "Green", "Yellow", "Orange", "Pink",
+            "Purple", "Brown", "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
         ]
-        color_pattern = "|".join(
-            re.escape(color) for color in sorted(known_colors, key=len, reverse=True)
-        )
-
+        color_pattern = "|".join(re.escape(color) for color in sorted(known_colors, key=len, reverse=True))
         color_match = re.search(rf"\b({color_pattern})\s*$", working, flags=re.I)
         if color_match:
             if not result["color"]:
                 result["color"] = clean_value(color_match.group(1))
             working = working[:color_match.start()].strip()
-
         qty_match = re.search(r"\b(\d{1,4})\s*$", working)
         if qty_match:
             result["qty"] = max(1, int(qty_match.group(1)))
             working = working[:qty_match.start()].strip()
-
-        size_pattern = (
-            r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
-            r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
-        )
+        size_pattern = r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
         size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
         if size_match:
             if not result["size"]:
                 result["size"] = clean_value(size_match.group(1))
             working = working[:size_match.start()].strip()
-
         candidate = clean_value(working)
         if not is_label_or_metadata(candidate, True):
             result["sku"] = candidate
 
-    # Absolute safety net: never allow Order No. or another header to enter the
-    # extracted data table as a SKU.
     if is_label_or_metadata(result["sku"], True):
         result["sku"] = ""
-
     return result
 
 
@@ -1919,7 +2061,8 @@ def reorganize_pdfs(uploaded_files):
             for page_number in range(len(document)):
                 page = document.load_page(page_number)
                 details = parse_product_details(
-                    extract_text_from_page(page)
+                    extract_text_from_page(page),
+                    page=page,
                 )
 
                 (
