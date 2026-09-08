@@ -1160,15 +1160,22 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
-    """Load and fully resolve every saved SKU → Master Product mapping.
+    """Load every accessible saved SKU → Master Product mapping.
 
-    A mapping table can store either a Master Product name or a
-    ``master_product_id``. The UI and PDF matcher must always receive the
-    actual Master Product name, so ID-based mappings are resolved against the
-    current company's master_products before they are returned.
+    This deliberately reads BOTH ownership styles used by older versions of the
+    app:
+
+    1. user-owned rows:    sku_mappings.user_id == current user
+    2. company-owned rows: sku_mappings.company_id == current company
+
+    Earlier versions of the app saved many mappings as company-owned rows without
+    a user_id. A newer version was only querying user_id when that column existed,
+    which made older mappings disappear even though they were still in Supabase.
     """
+
     company_id = get_company_id()
     user_id = get_current_user_id()
+
     if not company_id and not user_id:
         return []
 
@@ -1176,19 +1183,68 @@ def get_user_mappings():
         return []
 
     try:
-        query = supabase.table("sku_mappings").select("*")
-        # Prefer user ownership when that column exists. If an older mapping
-        # row is company-owned, a second company query below can still recover
-        # it instead of making an already-approved SKU disappear.
-        if _sku_mappings_has_user_id() and user_id:
-            query = query.eq("user_id", user_id)
-        elif company_id:
-            query = query.eq("company_id", company_id)
+        has_user_id = _sku_mappings_has_user_id()
 
-        rows = list(query.execute().data or [])
+        # IMPORTANT: Do not use elif here. We need the union of both the newer
+        # user-owned mappings and the legacy company-owned mappings.
+        query_specs = []
 
-        # Build ID → name lookup once. This is the critical step for schemas
-        # whose sku_mappings table stores master_product_id.
+        if has_user_id and user_id:
+            query_specs.append(("user_id", user_id))
+
+        if company_id:
+            query_specs.append(("company_id", company_id))
+
+        # If an installation has neither usable ownership value, fall back to the
+        # accessible rows. RLS still controls what the current user can read.
+        if not query_specs:
+            query_specs.append((None, None))
+
+        rows = []
+        seen_row_ids = set()
+
+        for column, value in query_specs:
+            try:
+                query = supabase.table("sku_mappings").select("*")
+
+                if column:
+                    query = query.eq(column, value)
+
+                fetched_rows = query.execute().data or []
+
+                for raw_row in fetched_rows:
+                    row_id = raw_row.get("id")
+                    # Prevent the same row returned by both ownership queries
+                    # from being processed twice.
+                    row_identity = (
+                        f"id:{row_id}"
+                        if row_id not in (None, "")
+                        else (
+                            "row:"
+                            + str(raw_row.get("sku", raw_row.get("sku_name", "")))
+                            + "|"
+                            + str(
+                                raw_row.get(
+                                    "master_product_name",
+                                    raw_row.get("master_product_id", ""),
+                                )
+                            )
+                        )
+                    )
+
+                    if row_identity in seen_row_ids:
+                        continue
+
+                    seen_row_ids.add(row_identity)
+                    rows.append(dict(raw_row or {}))
+
+            except Exception:
+                # A legacy database may not support one ownership column.
+                # Continue with the other ownership query instead of making all
+                # previous mappings disappear.
+                continue
+
+        # Build the Master Product ID → name lookup once.
         inventory = get_inventory()
         product_id_to_name = {
             str(product.get("id")): get_master_product_name(product)
@@ -1197,9 +1253,8 @@ def get_user_mappings():
         }
 
         mappings = []
-        for raw_row in rows:
-            row = dict(raw_row or {})
 
+        for row in rows:
             sku = (
                 row.get("sku")
                 or row.get("sku_name")
@@ -1221,11 +1276,12 @@ def get_user_mappings():
             )
 
             master_id = row.get("master_product_id")
+
             if not master_name and master_id not in (None, ""):
                 master_name = product_id_to_name.get(str(master_id), "")
 
-            # If the product was not included in the initial inventory lookup,
-            # make one direct lookup before treating the mapping as unresolved.
+            # Resolve an ID directly if the product was not present in the
+            # inventory cache.
             if not master_name and master_id not in (None, ""):
                 try:
                     product_query = (
@@ -1234,9 +1290,15 @@ def get_user_mappings():
                         .eq("id", master_id)
                         .limit(1)
                     )
+
                     if company_id:
-                        product_query = product_query.eq("company_id", company_id)
+                        product_query = product_query.eq(
+                            "company_id",
+                            company_id,
+                        )
+
                     product_rows = product_query.execute().data or []
+
                     if product_rows:
                         master_name = str(
                             product_rows[0].get("product_name") or ""
@@ -1248,22 +1310,32 @@ def get_user_mappings():
             row["master_product_name"] = str(master_name or "").strip()
             row["master_product_id"] = master_id
 
-            if row["sku"]:
+            # Keep only valid, usable mappings. A row with an empty SKU or an
+            # unresolved Master Product must not hide another valid exact mapping.
+            if row["sku"] and row["master_product_name"]:
                 mappings.append(row)
 
-        # Keep the newest usable mapping for every exact SKU string. A usable
-        # resolved Master Product always wins over an older broken/empty row.
+        # Deduplicate by the exact SKU string. This preserves the user's required
+        # character-for-character matching while combining legacy and new rows.
         deduplicated = {}
+
         for mapping in mappings:
             key = normalize_sku_key(mapping.get("sku"))
+
             if not key:
                 continue
+
             previous = deduplicated.get(key)
-            if (
-                previous is None
-                or (not previous.get("master_product_name") and mapping.get("master_product_name"))
-                or str(mapping.get("created_at", "")) >= str(previous.get("created_at", ""))
-            ):
+
+            if previous is None:
+                deduplicated[key] = mapping
+                continue
+
+            previous_created = str(previous.get("created_at", ""))
+            current_created = str(mapping.get("created_at", ""))
+
+            # Prefer the newest usable mapping when duplicates exist.
+            if current_created >= previous_created:
                 deduplicated[key] = mapping
 
         return list(deduplicated.values())
@@ -1271,6 +1343,7 @@ def get_user_mappings():
     except Exception as e:
         st.error(f"Could not load SKU mappings: {e}")
         return []
+
 
 def save_sku_mapping(sku, master_product_name):
     """Create or update a user-approved SKU → Master Product mapping.
@@ -1323,14 +1396,43 @@ def save_sku_mapping(sku, master_product_name):
 
         # Fetch the user's accessible mappings and find an existing row by the
         # same normalization used during future PDF matching.
-        existing_query = supabase.table("sku_mappings").select("id,*")
-        if has_user_id:
-            existing_query = existing_query.eq("user_id", user_id)
-        elif company_id:
-            existing_query = existing_query.eq("company_id", company_id)
-        existing_rows = existing_query.execute().data or []
+        # Search both ownership styles before deciding to insert a new mapping.
+        # This prevents a legacy company-owned mapping from being ignored simply
+        # because the current schema also has a user_id column.
+        existing_rows = []
+        seen_existing_ids = set()
 
-        sku_norm = normalize_sku_key(sku)
+        ownership_queries = []
+        if has_user_id and user_id:
+            ownership_queries.append(("user_id", user_id))
+        if company_id:
+            ownership_queries.append(("company_id", company_id))
+        if not ownership_queries:
+            ownership_queries.append((None, None))
+
+        for ownership_column, ownership_value in ownership_queries:
+            try:
+                existing_query = supabase.table("sku_mappings").select("id,*")
+                if ownership_column:
+                    existing_query = existing_query.eq(
+                        ownership_column,
+                        ownership_value,
+                    )
+
+                for row in existing_query.execute().data or []:
+                    row_id = row.get("id")
+                    row_key = (
+                        f"id:{row_id}"
+                        if row_id not in (None, "")
+                        else f"sku:{row.get(sku_column, '')}"
+                    )
+
+                    if row_key not in seen_existing_ids:
+                        seen_existing_ids.add(row_key)
+                        existing_rows.append(row)
+            except Exception:
+                continue
+
         existing_row = None
         for row in existing_rows:
             stored_sku = row.get(sku_column)
@@ -1424,6 +1526,7 @@ def extract_product_section(page_text):
         page_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
     if match:
         return match.group(1).strip()
 
@@ -1432,281 +1535,18 @@ def extract_product_section(page_text):
         page_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
     return fallback.group(1).strip() if fallback else ""
 
 
-def _clean_extracted_value(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip(" :-\t\n")
+def parse_product_details(page_text):
+    """Extract SKU, Size, Qty and Color from a Meesho label page safely.
 
-
-def _normalize_size_value(value):
-    """Return only the actual size mentioned on a label, otherwise empty.
-
-    Coordinate extraction can occasionally include nearby product-description
-    text in the Size column. We deliberately keep only a recognised size token
-    instead of returning the entire column text.
-    """
-    text = _clean_extracted_value(value)
-    if not text:
-        return ""
-
-    patterns = [
-        (r"\bfree\s+size\b", "Free Size"),
-        (r"\bone\s+size\b", "One Size"),
-        (r"\bxxxl\b", "XXXL"),
-        (r"\bxxl\b", "XXL"),
-        (r"\bxl\b", "XL"),
-        (r"\bxxs\b", "XXS"),
-        (r"\bxs\b", "XS"),
-        (r"\bsmall\b", "Small"),
-        (r"\bmedium\b", "Medium"),
-        (r"\blarge\b", "Large"),
-        (r"\bextra\s+large\b", "XL"),
-        (r"\bextra\s+small\b", "XS"),
-        (r"(?<![A-Za-z0-9])3XL(?![A-Za-z0-9])", "3XL"),
-        (r"(?<![A-Za-z0-9])2XL(?![A-Za-z0-9])", "2XL"),
-        (r"(?<![A-Za-z0-9])XL(?![A-Za-z0-9])", "XL"),
-        (r"(?<![A-Za-z0-9])L(?![A-Za-z0-9])", "L"),
-        (r"(?<![A-Za-z0-9])M(?![A-Za-z0-9])", "M"),
-        (r"(?<![A-Za-z0-9])S(?![A-Za-z0-9])", "S"),
-    ]
-    for pattern, normalized in patterns:
-        if re.search(pattern, text, flags=re.I):
-            return normalized
-
-    # Numeric garment/jewellery sizes are accepted only when they appear as a
-    # standalone value or with an explicit measurement unit. This prevents an
-    # order/reference number from becoming a size.
-    exact_numeric = re.fullmatch(r"\s*(\d{1,3}(?:\.\d+)?)\s*(cm|mm|inch|in)?\s*", text, flags=re.I)
-    if exact_numeric:
-        number = exact_numeric.group(1)
-        unit = exact_numeric.group(2)
-        return f"{number} {unit.lower()}" if unit else number
-
-    unit_match = re.search(r"\b(\d{1,3}(?:\.\d+)?)\s*(cm|mm|inch|in)\b", text, flags=re.I)
-    if unit_match:
-        return f"{unit_match.group(1)} {unit_match.group(2).lower()}"
-
-    return ""
-
-
-def _normalize_color_value(value):
-    """Return only the colour name from a noisy extracted colour cell."""
-    text = _clean_extracted_value(value)
-    if not text:
-        return ""
-
-    known_colors = [
-        "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
-        "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
-        "Golden", "Black", "White", "Red", "Blue", "Green", "Yellow",
-        "Orange", "Pink", "Purple", "Brown", "Grey", "Gray", "Gold",
-        "Silver", "Maroon", "Beige", "Cream", "Peach", "Turquoise",
-        "Violet", "Olive", "Mustard", "Coral",
-    ]
-    for color in sorted(known_colors, key=len, reverse=True):
-        match = re.search(rf"(?<![A-Za-z]){re.escape(color)}(?![A-Za-z])", text, flags=re.I)
-        if match:
-            normalized = match.group(0)
-            # Keep the requested display spelling consistent.
-            if normalized.lower() == "multi color":
-                return "Multicolor"
-            return normalized.title() if normalized.lower() not in {"multicolor"} else "Multicolor"
-    return ""
-
-
-def _is_invalid_sku(value):
-    value = _clean_extracted_value(value)
-    normalized = value.lower().rstrip(".:").strip()
-    invalid = {
-        "", "sku", "size", "qty", "quantity", "color", "colour",
-        "order no", "order number", "product details", "order details",
-        "tax invoice", "invoice", "page",
-    }
-    if normalized in invalid:
-        return True
-    if re.fullmatch(
-        r"(?:sku|size|qty|quantity|colou?r|order\s*(?:no\.?|number))",
-        normalized,
-        flags=re.I,
-    ):
-        return True
-    return False
-
-
-def _group_page_words_into_lines(words, tolerance=3.5):
-    """Return PyMuPDF words grouped into visual lines by their Y coordinate."""
-    if not words:
-        return []
-    sorted_words = sorted(words, key=lambda w: (float(w[1]), float(w[0])))
-    lines = []
-    for word in sorted_words:
-        x0, y0, x1, y1, text = word[:5]
-        if not str(text).strip():
-            continue
-        cy = (float(y0) + float(y1)) / 2
-        if lines and abs(cy - lines[-1]["cy"]) <= tolerance:
-            lines[-1]["words"].append((float(x0), float(y0), float(x1), float(y1), str(text)))
-            count = len(lines[-1]["words"])
-            lines[-1]["cy"] = ((lines[-1]["cy"] * (count - 1)) + cy) / count
-        else:
-            lines.append({
-                "cy": cy,
-                "words": [(float(x0), float(y0), float(x1), float(y1), str(text))],
-            })
-    for line in lines:
-        line["words"].sort(key=lambda w: w[0])
-        line["text"] = " ".join(w[4] for w in line["words"]).strip()
-    return lines
-
-
-def _header_positions_from_line(line):
-    """Find SKU / Size / Qty / Color header X positions on one visual line."""
-    positions = {}
-    aliases = {
-        "sku": {"sku"},
-        "size": {"size"},
-        "qty": {"qty", "quantity"},
-        "color": {"color", "colour"},
-    }
-    for x0, _y0, x1, _y1, text in line["words"]:
-        token = re.sub(r"[^a-z]", "", text.lower())
-        for field, names in aliases.items():
-            if token in names and field not in positions:
-                positions[field] = (x0 + x1) / 2
-    return positions
-
-
-def _find_product_table_header(lines):
-    """Locate the most likely visual SKU/Size/Qty/Color header row."""
-    best = None
-    for index, line in enumerate(lines):
-        positions = _header_positions_from_line(line)
-        score = len(positions)
-        if score < 2:
-            continue
-        # A real product table normally contains SKU plus at least one other
-        # product attribute. Prefer rows containing all four headers.
-        if "sku" in positions:
-            score += 2
-        if "qty" in positions:
-            score += 1
-        if best is None or score > best[0]:
-            best = (score, index, positions)
-    return best
-
-
-def _column_bounds(header_positions, page_width):
-    ordered = sorted(header_positions.items(), key=lambda item: item[1])
-    bounds = {}
-    for index, (field, x) in enumerate(ordered):
-        left = 0.0 if index == 0 else (ordered[index - 1][1] + x) / 2
-        right = page_width if index == len(ordered) - 1 else (x + ordered[index + 1][1]) / 2
-        bounds[field] = (left, right)
-    return bounds
-
-
-def _looks_like_section_start(text):
-    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
-    return any(marker in normalized for marker in [
-        "order no", "order number", "order details", "tax invoice",
-        "bill to", "ship to", "seller details", "payment details",
-        "purchase order", "invoice no",
-    ])
-
-
-def _extract_visual_table_values(page):
-    """Extract product fields from their actual PDF X/Y positions.
-
-    Plain ``get_text('text')`` does not preserve table columns reliably. This
-    routine uses PyMuPDF word coordinates, finds the SKU/Size/Qty/Color header
-    row and reads the first product row directly underneath each column.
-    """
-    empty = {"sku": "", "size": "", "qty": 1, "color": ""}
-    try:
-        words = page.get_text("words") or []
-    except Exception:
-        return empty
-
-    lines = _group_page_words_into_lines(words)
-    header = _find_product_table_header(lines)
-    if not header:
-        return empty
-
-    _score, header_index, positions = header
-    page_width = float(page.rect.width)
-    bounds = _column_bounds(positions, page_width)
-    header_y = lines[header_index]["cy"]
-
-    # Product values can wrap onto two visual lines. Read a compact block below
-    # the header, stopping before order/invoice metadata. Only words inside each
-    # visual column are accepted.
-    collected = {field: [] for field in bounds}
-    data_line_count = 0
-    for line in lines[header_index + 1:]:
-        if line["cy"] - header_y > 130:
-            break
-        text = line["text"]
-        if data_line_count > 0 and _looks_like_section_start(text):
-            break
-        if _looks_like_section_start(text) and not collected.get("sku"):
-            break
-
-        line_values = {field: [] for field in bounds}
-        for x0, _y0, x1, _y1, word in line["words"]:
-            cx = (x0 + x1) / 2
-            for field, (left, right) in bounds.items():
-                if left <= cx < right:
-                    line_values[field].append((x0, word))
-                    break
-
-        if not any(line_values.values()):
-            continue
-
-        # Ignore another repeated header row.
-        normalized_line = text.lower()
-        if sum(token in normalized_line for token in ("sku", "size", "qty", "color", "colour")) >= 3:
-            continue
-
-        for field, values in line_values.items():
-            if values:
-                values.sort(key=lambda item: item[0])
-                collected[field].append(" ".join(word for _, word in values))
-
-        data_line_count += 1
-        # Normally one row is enough. Allow a second line only when the SKU or
-        # another product value appears wrapped and no metadata has begun.
-        if data_line_count >= 2:
-            break
-
-    result = dict(empty)
-    for field, parts in collected.items():
-        if not parts:
-            continue
-        value = _clean_extracted_value(" ".join(parts))
-        if field == "sku":
-            if not _is_invalid_sku(value):
-                result[field] = value
-        elif field == "qty":
-            match = re.search(r"\b(\d+)\b", value)
-            if match:
-                result[field] = max(1, int(match.group(1)))
-        elif field == "size":
-            result[field] = _normalize_size_value(value)
-        elif field == "color":
-            result[field] = _normalize_color_value(value)
-
-    return result
-
-
-def parse_product_details(page_text, page=None):
-    """Extract SKU, Size, Qty and Color from a Meesho label.
-
-    The parser first uses the PDF's actual word coordinates whenever a PyMuPDF
-    page is supplied. This prevents SKU text from being incorrectly copied into
-    Size or Color when a PDF's plain text extraction loses the table layout.
-    The older text parser remains as a fallback for labels whose table headers
-    cannot be detected.
+    Meesho PDFs do not always preserve their visual table layout when text is
+    extracted. A common failure mode is reading the header ``SKU Size Qty Color
+    Order No.`` as if ``Order No.`` were the SKU value. This parser searches the
+    whole page for real field/value pairs, explicitly rejects table headers and
+    order metadata, and only then falls back to the older table-style parser.
     """
     result = {
         "sku": "",
@@ -1715,14 +1555,6 @@ def parse_product_details(page_text, page=None):
         "color": "",
         "raw_product_details": extract_product_section(page_text),
     }
-
-    if page is not None:
-        visual = _extract_visual_table_values(page)
-        if visual.get("sku"):
-            result.update(visual)
-            # A valid visual table extraction is authoritative. Do not let the
-            # unreliable plain-text order overwrite Size or Color.
-            return result
 
     if not page_text:
         return result
@@ -1737,12 +1569,15 @@ def parse_product_details(page_text, page=None):
         "sku", "size", "qty", "quantity", "color", "colour",
         "order no", "order no.", "order number", "product details",
     }
-    invalid_sku_values = field_labels | {
+    invalid_sku_values = {
+        "sku", "size", "qty", "quantity", "color", "colour",
+        "order no", "order no.", "order number", "product details",
         "order details", "tax invoice", "invoice", "page",
     }
 
     def clean_value(value):
-        return _clean_extracted_value(value)
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" :-\t")
+        return value
 
     def is_label_or_metadata(value, for_sku=False):
         value = clean_value(value)
@@ -1755,22 +1590,34 @@ def parse_product_details(page_text, page=None):
             return True
         if re.fullmatch(r"(?:order\s*)?(?:no|number)\.?", normalized, flags=re.I):
             return True
+        # A value that is itself only a column heading is never a product SKU.
         if for_sku and re.fullmatch(r"(?:sku|size|qty|quantity|colou?r|order\s*(?:no\.?|number))", normalized, flags=re.I):
             return True
         return False
 
     def line_values_after_label(labels, for_sku=False):
+        """Return every plausible value following a label occurrence."""
         found = []
         normalized_labels = [label.lower() for label in labels]
+
         for index, line in enumerate(raw_lines):
             compact = clean_value(line)
             lower = compact.lower().rstrip(":-").strip()
+
+            # Same-line form: SKU: ABC-123
             for label in normalized_labels:
-                match = re.match(rf"^{re.escape(label)}\s*[:\-]\s*(.+)$", compact, flags=re.I)
+                match = re.match(
+                    rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
+                    compact,
+                    flags=re.I,
+                )
                 if match:
                     value = clean_value(match.group(1))
                     if not is_label_or_metadata(value, for_sku):
                         found.append(value)
+
+            # Label on its own line. Keep looking past consecutive column
+            # headers, but never accept Order No. as a product value.
             if lower in normalized_labels:
                 for next_index in range(index + 1, len(raw_lines)):
                     candidate = clean_value(raw_lines[next_index])
@@ -1781,10 +1628,12 @@ def parse_product_details(page_text, page=None):
                         continue
                     found.append(candidate)
                     break
+
         return found
 
     def choose_best(values, for_sku=False):
-        cleaned, seen = [], set()
+        cleaned = []
+        seen = set()
         for value in values:
             value = clean_value(value)
             key = value.lower()
@@ -1792,24 +1641,32 @@ def parse_product_details(page_text, page=None):
                 continue
             seen.add(key)
             cleaned.append(value)
+
         if not cleaned:
             return ""
+
+        # Product SKUs are normally more descriptive than a one-word field
+        # value. Prefer values containing letters and multiple characters.
         if for_sku:
             product_like = [
                 value for value in cleaned
-                if re.search(r"[A-Za-z]", value) and not re.fullmatch(r"\d+", value)
+                if re.search(r"[A-Za-z]", value)
+                and not re.fullmatch(r"\d+", value)
             ]
             if product_like:
                 return max(product_like, key=len)
         return cleaned[0]
 
-    result["sku"] = choose_best(line_values_after_label(("SKU",), for_sku=True), for_sku=True)
-    result["size"] = _normalize_size_value(
-        choose_best(line_values_after_label(("Size",)))
+    result["sku"] = choose_best(
+        line_values_after_label(("SKU",), for_sku=True),
+        for_sku=True,
+    )
+    result["size"] = choose_best(
+        line_values_after_label(("Size",)),
     )
     qty_values = line_values_after_label(("Qty", "Quantity"))
-    result["color"] = _normalize_color_value(
-        choose_best(line_values_after_label(("Color", "Colour")))
+    result["color"] = choose_best(
+        line_values_after_label(("Color", "Colour")),
     )
 
     for value in qty_values:
@@ -1818,6 +1675,9 @@ def parse_product_details(page_text, page=None):
             result["qty"] = max(1, int(qty_match.group(1)))
             break
 
+    # Text extraction can flatten the table into one line. Search for a SKU
+    # value bounded by another recognised field. This deliberately includes
+    # Order No. as a boundary so it cannot become the SKU value.
     if not result["sku"]:
         flat = "\n".join(raw_lines)
         sku_matches = re.finditer(
@@ -1831,46 +1691,59 @@ def parse_product_details(page_text, page=None):
                 result["sku"] = value
                 break
 
+    # Last-resort legacy parser. Use the Product Details block first, then the
+    # whole page, but strip all known headers before interpreting the row.
     if not result["sku"]:
         source = result["raw_product_details"] or page_text
         source = re.sub(
             r"\b(?:Product\s*Details|SKU|Size|Qty|Quantity|Color|Colour|Order\s*(?:No\.?|Number))\b",
-            " ", source, flags=re.I,
+            " ",
+            source,
+            flags=re.I,
         )
         working = re.sub(r"\s+", " ", source).strip()
+
         known_colors = [
-            "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
-            "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
-            "Black", "White", "Red", "Blue", "Green", "Yellow", "Orange", "Pink",
-            "Purple", "Brown", "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
+            "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
+            "Dark Blue", "Sky Blue", "Navy Blue", "Bottle Green",
+            "Sea Green", "Off White", "Black", "White", "Red", "Blue",
+            "Green", "Yellow", "Orange", "Pink", "Purple", "Brown",
+            "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
         ]
-        color_pattern = "|".join(re.escape(color) for color in sorted(known_colors, key=len, reverse=True))
+        color_pattern = "|".join(
+            re.escape(color) for color in sorted(known_colors, key=len, reverse=True)
+        )
+
         color_match = re.search(rf"\b({color_pattern})\s*$", working, flags=re.I)
         if color_match:
             if not result["color"]:
-                result["color"] = _normalize_color_value(color_match.group(1))
+                result["color"] = clean_value(color_match.group(1))
             working = working[:color_match.start()].strip()
+
         qty_match = re.search(r"\b(\d{1,4})\s*$", working)
         if qty_match:
             result["qty"] = max(1, int(qty_match.group(1)))
             working = working[:qty_match.start()].strip()
-        size_pattern = r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
+
+        size_pattern = (
+            r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
+            r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
+        )
         size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
         if size_match:
             if not result["size"]:
-                result["size"] = _normalize_size_value(size_match.group(1))
+                result["size"] = clean_value(size_match.group(1))
             working = working[:size_match.start()].strip()
+
         candidate = clean_value(working)
         if not is_label_or_metadata(candidate, True):
             result["sku"] = candidate
 
+    # Absolute safety net: never allow Order No. or another header to enter the
+    # extracted data table as a SKU.
     if is_label_or_metadata(result["sku"], True):
         result["sku"] = ""
 
-    # Final cleanup guarantees that noisy neighbouring text, SKU/order numbers
-    # and other column spillover never appear in Size or Color.
-    result["size"] = _normalize_size_value(result.get("size", ""))
-    result["color"] = _normalize_color_value(result.get("color", ""))
     return result
 
 
@@ -2148,8 +2021,7 @@ def reorganize_pdfs(uploaded_files):
             for page_number in range(len(document)):
                 page = document.load_page(page_number)
                 details = parse_product_details(
-                    extract_text_from_page(page),
-                    page=page,
+                    extract_text_from_page(page)
                 )
 
                 (
