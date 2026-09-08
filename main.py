@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 import time
 import uuid
+import math
 import extra_streamlit_components as stx
 
 st.set_page_config(
@@ -27,6 +28,14 @@ COOKIE_ACCESS = "meesho_access_token"
 COOKIE_REFRESH = "meesho_refresh_token"
 COOKIE_LOGIN_MARKER = "meesho_login_marker"
 COOKIE_EXPIRY_DAYS = 30
+
+# Sales reporting and automatic stock planning settings.
+# A recommended minimum stock is calculated from the last 7 days of actual
+# Pick-Up List deductions and should cover the next five days of demand.
+SALES_REPORT_MAX_DAYS = 30
+MIN_STOCK_COVERAGE_DAYS = 5
+PICKUP_DEDUCTION_REASON_PREFIX = "Pick-Up List deduction"
+LEGACY_PICKUP_DEDUCTION_REASON = "Automatic deduction from organized PDF batch"
 
 
 # ============================================================
@@ -2226,8 +2235,14 @@ def create_pickup_list(categorized_pages):
     return dataframe
 
 
-def deduct_inventory_from_pickup(pickup_dataframe):
-    inventory = get_inventory()
+def deduct_inventory_from_pickup(pickup_dataframe, pickup_list_id=None):
+    """Deduct one Pick-Up List and record each deduction as a sale event.
+
+    Negative inventory-history entries created here are the single source of
+    truth for the Sales Reports page. The reason includes the stable Pick-Up
+    List ID so future reports can be traced back to the exact batch.
+    """
+    inventory = get_inventory(force_refresh=True)
 
     inventory_lookup = {
         normalize_text(product.get("product_name")): product
@@ -2236,39 +2251,190 @@ def deduct_inventory_from_pickup(pickup_dataframe):
 
     successful = 0
     failed = []
+    pickup_reason = (
+        f"{PICKUP_DEDUCTION_REASON_PREFIX} | {pickup_list_id}"
+        if pickup_list_id
+        else PICKUP_DEDUCTION_REASON_PREFIX
+    )
 
     for _, row in pickup_dataframe.iterrows():
         product_name = str(row["Master Product"]).strip()
-        quantity_needed = int(
-            row.get("Total Quantity", 0) or 0
-        )
+        quantity_needed = int(row.get("Total Quantity", 0) or 0)
 
-        product = inventory_lookup.get(
-            normalize_text(product_name)
-        )
+        product = inventory_lookup.get(normalize_text(product_name))
 
         if not product:
-            failed.append(
-                f"{product_name}: Master Product not found."
-            )
+            failed.append(f"{product_name}: Master Product not found.")
             continue
 
-        current = int(
-            product.get("inventory_quantity", 0) or 0
-        )
+        current = int(product.get("inventory_quantity", 0) or 0)
 
         if update_inventory(
             product["id"],
             max(0, current - quantity_needed),
-            "Automatic deduction from organized PDF batch",
+            pickup_reason,
         ):
             successful += 1
         else:
-            failed.append(
-                f"{product_name}: Inventory update failed."
-            )
+            failed.append(f"{product_name}: Inventory update failed.")
+
+    if successful:
+        # Refresh the product cache and automatically recalculate minimum stock
+        # from the latest rolling weekly sales after the deduction is recorded.
+        invalidate_inventory_cache()
+        update_automatic_minimum_stock_from_sales()
 
     return successful, failed
+
+
+def _is_pickup_deduction_history_row(row):
+    """Return True only for inventory history produced by Pick-Up List sales."""
+    reason = str(row.get("reason", "") or "")
+    return (
+        reason.startswith(PICKUP_DEDUCTION_REASON_PREFIX)
+        or reason == LEGACY_PICKUP_DEDUCTION_REASON
+    )
+
+
+def get_pickup_sales_history(days=SALES_REPORT_MAX_DAYS):
+    """Load negative inventory changes caused specifically by Pick-Up Lists."""
+    company_id = get_company_id()
+    if not company_id:
+        return []
+
+    start_time = now_utc() - timedelta(days=max(1, int(days)))
+
+    try:
+        response = (
+            supabase.table("inventory_history")
+            .select("master_product_id, change_quantity, reason, created_at")
+            .eq("company_id", company_id)
+            .lt("change_quantity", 0)
+            .gte("created_at", start_time.isoformat())
+            .execute()
+        )
+        return [
+            row for row in (response.data or [])
+            if _is_pickup_deduction_history_row(row)
+        ]
+    except Exception as e:
+        st.error(f"Could not load Pick-Up List sales history: {e}")
+        return []
+
+
+def get_sales_by_master_product(days):
+    """Aggregate actual sales from Pick-Up List inventory deductions."""
+    inventory = get_inventory(force_refresh=True)
+    product_lookup = {
+        product.get("id"): product
+        for product in inventory
+        if product.get("id")
+    }
+
+    totals = {product_id: 0 for product_id in product_lookup}
+    for row in get_pickup_sales_history(days):
+        product_id = row.get("master_product_id")
+        if product_id in totals:
+            totals[product_id] += abs(int(row.get("change_quantity", 0) or 0))
+
+    rows = []
+    for product_id, product in product_lookup.items():
+        weekly_sales = totals.get(product_id, 0)
+        rows.append({
+            "Master Product": product.get("product_name", "Unnamed Product"),
+            "Sales": int(weekly_sales),
+            "Current Inventory": int(product.get("inventory_quantity", 0) or 0),
+            "Current Minimum Stock": int(product.get("minimum_stock", 0) or 0),
+            "Product ID": product_id,
+        })
+
+    return rows
+
+
+def get_sales_report_rows():
+    """Build a combined Daily / Weekly / Monthly sales report."""
+    inventory = get_inventory(force_refresh=True)
+    products = {
+        product.get("id"): product
+        for product in inventory
+        if product.get("id")
+    }
+
+    totals = {
+        1: {product_id: 0 for product_id in products},
+        7: {product_id: 0 for product_id in products},
+        30: {product_id: 0 for product_id in products},
+    }
+
+    histories = {
+        days: get_pickup_sales_history(days)
+        for days in (1, 7, 30)
+    }
+
+    for days, rows in histories.items():
+        for row in rows:
+            product_id = row.get("master_product_id")
+            if product_id in totals[days]:
+                totals[days][product_id] += abs(
+                    int(row.get("change_quantity", 0) or 0)
+                )
+
+    report_rows = []
+    for product_id, product in products.items():
+        weekly_sales = int(totals[7].get(product_id, 0))
+        # 5 days of stock based on the actual average daily sales from the last
+        # seven days. Always round up so the stock covers the full five days.
+        recommended_minimum = (
+            int(math.ceil((weekly_sales / 7) * MIN_STOCK_COVERAGE_DAYS))
+            if weekly_sales > 0 else 0
+        )
+
+        report_rows.append({
+            "Master Product": product.get("product_name", "Unnamed Product"),
+            "Daily Sales (Last 24h)": int(totals[1].get(product_id, 0)),
+            "Weekly Sales (Last 7 Days)": weekly_sales,
+            "Monthly Sales (Last 30 Days)": int(totals[30].get(product_id, 0)),
+            "Recommended Min Stock (5 Days)": recommended_minimum,
+            "Current Min Stock": int(product.get("minimum_stock", 0) or 0),
+            "Current Inventory": int(product.get("inventory_quantity", 0) or 0),
+            "Product ID": product_id,
+        })
+
+    return report_rows
+
+
+def update_automatic_minimum_stock_from_sales():
+    """Automatically set minimum stock from rolling 7-day Pick-Up List sales.
+
+    Existing minimum stock is never reduced automatically. This means a manual
+    safety limit is respected while fast-selling products are raised to at
+    least the amount needed for five days of sales.
+    """
+    report_rows = get_sales_report_rows()
+    changed = 0
+
+    for row in report_rows:
+        recommended = int(row["Recommended Min Stock (5 Days)"] or 0)
+        current_minimum = int(row["Current Min Stock"] or 0)
+        if recommended <= current_minimum:
+            continue
+
+        try:
+            (
+                supabase.table("master_products")
+                .update({"minimum_stock": recommended})
+                .eq("id", row["Product ID"])
+                .eq("company_id", get_company_id())
+                .execute()
+            )
+            changed += 1
+        except Exception:
+            pass
+
+    if changed:
+        invalidate_inventory_cache()
+
+    return changed
 
 
 # ============================================================
@@ -3236,7 +3402,8 @@ def show_pdf_organizer():
 
                 success_count, failed = (
                     deduct_inventory_from_pickup(
-                        pickup_dataframe
+                        pickup_dataframe,
+                        pickup_list_id,
                     )
                 )
 
@@ -3375,6 +3542,96 @@ def show_inventory():
 
 
 # ============================================================
+# SALES REPORTS PAGE
+# ============================================================
+
+def show_sales_reports():
+    st.title("📊 Sales & Stock Reports")
+    st.caption(
+        "Sales are calculated only from inventory deductions made through "
+        "Pick-Up Lists. Manual inventory changes are not counted as sales."
+    )
+
+    report_rows = get_sales_report_rows()
+
+    if not report_rows:
+        st.info("No Master Products are available yet.")
+        return
+
+    report_df = pd.DataFrame(report_rows)
+    total_daily = int(report_df["Daily Sales (Last 24h)"].sum())
+    total_weekly = int(report_df["Weekly Sales (Last 7 Days)"].sum())
+    total_monthly = int(report_df["Monthly Sales (Last 30 Days)"].sum())
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📅 Daily Sales", total_daily)
+    col2.metric("📆 Weekly Sales", total_weekly)
+    col3.metric("🗓️ Monthly Sales", total_monthly)
+
+    st.divider()
+    st.subheader("📦 Sales by Master Product")
+
+    display_df = report_df.drop(columns=["Product ID"])
+    st.dataframe(
+        display_df.sort_values(
+            "Weekly Sales (Last 7 Days)",
+            ascending=False,
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+    st.subheader("⚙️ Automatic Minimum Stock")
+    st.info(
+        "Formula: Weekly sales ÷ 7 × 5 days, rounded up. "
+        "For example, 1,000 weekly orders recommends a minimum stock of 715 units."
+    )
+
+    needs_update = report_df[
+        report_df["Recommended Min Stock (5 Days)"]
+        > report_df["Current Min Stock"]
+    ]
+
+    if needs_update.empty:
+        st.success(
+            "All current minimum stock limits already cover at least five days "
+            "of recent weekly sales."
+        )
+    else:
+        st.warning(
+            f"{len(needs_update)} product(s) have a minimum stock below the "
+            "recommended five-day level."
+        )
+        st.dataframe(
+            needs_update.drop(columns=["Product ID"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if st.button(
+            "⚡ Update Minimum Stock Automatically",
+            type="primary",
+            use_container_width=True,
+        ):
+            changed = update_automatic_minimum_stock_from_sales()
+            invalidate_inventory_cache()
+            if changed:
+                st.success(
+                    f"Updated the minimum stock for {changed} Master Product(s)."
+                )
+            else:
+                st.info("No minimum stock changes were required.")
+            st.rerun()
+
+    st.caption(
+        "Automatic updates are also checked after every successful Pick-Up List "
+        "inventory deduction. Existing higher manual minimum-stock limits are "
+        "not automatically lowered."
+    )
+
+
+# ============================================================
 # SUBSCRIPTION PAGE
 # ============================================================
 
@@ -3505,6 +3762,7 @@ def show_main_app():
             "Master Products",
             "SKU Mappings",
             "Inventory",
+            "Sales Reports",
             "Subscription",
         ]
 
@@ -3547,6 +3805,7 @@ def show_main_app():
         "Master Products",
         "SKU Mappings",
         "Inventory",
+        "Sales Reports",
     }
 
     if page in restricted_pages and not subscription["access"]:
@@ -3570,6 +3829,8 @@ def show_main_app():
         show_sku_mappings()
     elif page == "Inventory":
         show_inventory()
+    elif page == "Sales Reports":
+        show_sales_reports()
     elif page == "Subscription":
         show_subscription_page()
 
