@@ -130,9 +130,9 @@ def format_datetime(value):
 def clear_auth_cookies():
     """Cookies are cleared only by an explicit user logout."""
     try:
-        cookie_manager.delete(COOKIE_ACCESS, key="delete_meesho_access")
-        cookie_manager.delete(COOKIE_REFRESH, key="delete_meesho_refresh")
-        cookie_manager.delete(COOKIE_LOGIN_MARKER, key="delete_meesho_marker")
+        cookie_manager.delete(COOKIE_ACCESS)
+        cookie_manager.delete(COOKIE_REFRESH)
+        cookie_manager.delete(COOKIE_LOGIN_MARKER)
     except Exception:
         pass
 
@@ -148,23 +148,10 @@ def save_auth_session(session):
         refresh_token = getattr(session, "refresh_token", None)
         user = getattr(session, "user", None)
 
-        # IMPORTANT: every CookieManager command needs its own component key.
-        # Reusing the default key for several set() calls in one Streamlit run
-        # can cause only one cookie command to reach the browser.
         if access_token:
-            cookie_manager.set(
-                COOKIE_ACCESS,
-                str(access_token),
-                expires_at=expires_at,
-                key="set_meesho_access",
-            )
+            cookie_manager.set(COOKIE_ACCESS, str(access_token), expires_at=expires_at)
         if refresh_token:
-            cookie_manager.set(
-                COOKIE_REFRESH,
-                str(refresh_token),
-                expires_at=expires_at,
-                key="set_meesho_refresh",
-            )
+            cookie_manager.set(COOKIE_REFRESH, str(refresh_token), expires_at=expires_at)
 
         # This marker lets the app distinguish a returning user whose browser
         # cookies are still loading from a genuinely new visitor.
@@ -173,7 +160,6 @@ def save_auth_session(session):
                 COOKIE_LOGIN_MARKER,
                 str(user.id),
                 expires_at=expires_at,
-                key="set_meesho_marker",
             )
     except Exception:
         # Never treat a temporary CookieManager issue as a logout.
@@ -199,8 +185,7 @@ def get_response_user(response):
 def _get_cookie_auth():
     """Read authentication cookies without mistaking component startup for logout."""
     try:
-        # Use a stable, explicit key for the read component as well.
-        cookies = cookie_manager.get_all(key="read_meesho_auth_cookies")
+        cookies = cookie_manager.get_all()
         if cookies is None:
             return None, None, None, False, False
         if not isinstance(cookies, dict):
@@ -347,10 +332,54 @@ def safe_get_profile(user_id):
         return None
 
 
+def ensure_profile():
+    """
+    Ensure every authenticated user has a profile row.
+
+    A missing profile must never be treated as a logout or as an authentication
+    failure. The user remains logged in; a profile is created when the database
+    policy allows it.
+    """
+    user_id = get_current_user_id()
+    if not user_id:
+        return None
+
+    existing = safe_get_profile(user_id)
+    if existing:
+        return existing
+
+    user = st.session_state.get("user")
+    metadata = getattr(user, "user_metadata", None) or {}
+    email = get_current_email()
+    company_name = (
+        metadata.get("company_name")
+        or metadata.get("full_name")
+        or (email.split("@")[0] if email else "Meesho Label Organizer")
+    )
+
+    payload = {
+        "id": user_id,
+        "company_id": user_id,
+        "company_name": company_name,
+    }
+
+    try:
+        (
+            supabase.table("profiles")
+            .upsert(payload, on_conflict="id")
+            .execute()
+        )
+    except Exception:
+        # RLS/schema problems must not log the user out or block the app.
+        pass
+
+    return safe_get_profile(user_id)
+
+
 def refresh_profile():
     user_id = get_current_user_id()
     st.session_state.profile = (
-        safe_get_profile(user_id) if user_id else None
+        ensure_profile() if user_id else None
     )
 
 
@@ -378,16 +407,17 @@ def get_subscription_status():
             "reason": "Full administrator application access",
         }
 
-    profile = st.session_state.get("profile")
+    # Subscription access belongs to the authenticated user. A missing
+    # company profile must not break login or subscription checks.
+    profile = st.session_state.get("profile") or {}
+    user_id = get_current_user_id()
 
-    if not profile:
+    if not user_id:
         return {
             "access": False,
             "plan": "Expired",
-            "reason": "Company profile not found",
+            "reason": "No authenticated user",
         }
-
-    user_id = get_current_user_id()
 
     try:
         response = (
@@ -461,12 +491,17 @@ def get_subscription_status():
 
 
 def start_demo():
-    profile = st.session_state.get("profile")
     user_id = get_current_user_id()
-
-    if not profile or not user_id or profile.get("demo_started_at"):
+    if not user_id:
         return False
 
+    profile = st.session_state.get("profile") or ensure_profile() or {}
+
+    if profile.get("demo_started_at"):
+        return False
+
+    # If the profile could not be created because of an RLS policy, report the
+    # actual database issue instead of treating it as a logout.
     try:
         (
             supabase.table("profiles")
@@ -531,12 +566,7 @@ def login_user(email, password):
             # Keep a login marker even if the auth response does not expose
             # the session object in this client version.
             try:
-                cookie_manager.set(
-                    COOKIE_LOGIN_MARKER,
-                    str(user.id),
-                    expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS),
-                    key="set_meesho_marker",
-                )
+                cookie_manager.set(COOKIE_LOGIN_MARKER, str(user.id), expires_at=now_utc() + timedelta(days=COOKIE_EXPIRY_DAYS))
             except Exception:
                 pass
 
@@ -2975,6 +3005,28 @@ def show_main_app():
             logout()
 
     page = st.session_state.current_page
+    subscription = get_subscription_status()
+
+    # Unsubscribed/expired users may stay logged in and view their dashboard
+    # and plans, but paid features require an active monthly or lifetime plan
+    # (or an active demo).
+    restricted_pages = {
+        "PDF Organizer",
+        "Master Products",
+        "SKU Mappings",
+        "Inventory",
+    }
+
+    if page in restricted_pages and not subscription["access"]:
+        st.warning(
+            "Your account is logged in, but this feature requires an active "
+            "subscription or demo."
+        )
+        st.info(subscription["reason"])
+        if st.button("View Subscription Plans", type="primary"):
+            st.session_state.current_page = "Subscription"
+            st.rerun()
+        return
 
     if page == "Dashboard":
         show_dashboard()
@@ -2998,20 +3050,13 @@ if st.session_state.user is None:
     restored = restore_login_from_cookie()
 
     if restored is None:
-        # CookieManager may need a few browser round-trips after a hard refresh.
-        # Do not wait forever: retry a small number of times, and never clear
-        # authentication cookies or call logout during this process.
-        attempts = int(st.session_state.get("auth_restore_attempts", 0))
+        # IMPORTANT: Do not call st.rerun() in a loop here. The CookieManager
+        # frontend component needs this run to remain alive long enough to read
+        # the browser cookies and send its value back to Streamlit. Repeated
+        # forced reruns can restart the component before it finishes, causing
+        # the endless "Restoring your login session" -> logout cycle.
         st.info("Restoring your login session…")
-
-        if attempts < 6:
-            time.sleep(0.35)
-            st.rerun()
-
-        # The browser component still has not returned a usable result. Continue
-        # to the normal login screen instead of leaving the app permanently stuck.
-        # This is NOT a logout and does not delete any saved browser cookies.
-        st.session_state.auth_restore_pending = False
+        st.stop()
 
 if st.session_state.user is None:
     show_auth_page()
@@ -3020,20 +3065,10 @@ if st.session_state.user is None:
 # Re-check the session afterwards instead of forcing an immediate rerun, because
 # the current run must finish for CookieManager to write browser cookies.
 if st.session_state.user is not None:
+    # A missing profile is a database/profile issue, not an authentication issue.
+    # Never log out or block an authenticated user because another user's profile
+    # row is missing or temporarily unavailable.
     if st.session_state.profile is None:
         refresh_profile()
 
-    # Admin access is allowed even if the profile table has a problem.
-    if (
-        st.session_state.profile is None
-        and not is_admin()
-    ):
-        st.error(
-            "Your account is authenticated, but its company profile "
-            "could not be loaded. Check the profiles table and RLS policies."
-        )
-
-        if st.button("Logout"):
-            logout()
-    else:
-        show_main_app()
+    show_main_app()
