@@ -6,9 +6,10 @@ import re
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 import time
-import uuid
-import math
 import extra_streamlit_components as stx
+import razorpay
+import uuid
+
 
 st.set_page_config(
     page_title="Meesho Label Organizer",
@@ -18,7 +19,9 @@ st.set_page_config(
 )
 
 MONTHLY_PRICE = 399
-LIFETIME_PRICE = 9999
+LIFETIME_PRICE = 7777
+LIFETIME_COUPON_DISCOUNT_PERCENT = 10
+LIFETIME_COUPON_CODE = str(st.secrets.get("LIFETIME_COUPON_CODE", "LIFETIME10")).strip()
 DEMO_HOURS = 12
 DEMO_PDF_LIMIT = 2
 ADMIN_EMAILS = {"keyurtank8@gmail.com"}
@@ -28,14 +31,6 @@ COOKIE_ACCESS = "meesho_access_token"
 COOKIE_REFRESH = "meesho_refresh_token"
 COOKIE_LOGIN_MARKER = "meesho_login_marker"
 COOKIE_EXPIRY_DAYS = 30
-
-# Sales reporting and automatic stock planning settings.
-# A recommended minimum stock is calculated from the last 7 days of actual
-# Pick-Up List deductions and should cover the next five days of demand.
-SALES_REPORT_MAX_DAYS = 30
-MIN_STOCK_COVERAGE_DAYS = 5
-PICKUP_DEDUCTION_REASON_PREFIX = "Pick-Up List deduction"
-LEGACY_PICKUP_DEDUCTION_REASON = "Automatic deduction from organized PDF batch"
 
 
 # ============================================================
@@ -66,6 +61,29 @@ supabase: Client = get_supabase()
 cookie_manager = get_cookie_manager()
 
 
+def get_razorpay_client():
+    """Create a server-side Razorpay client using Streamlit Secrets."""
+    try:
+        key_id = str(st.secrets["RAZORPAY_KEY_ID"]).strip()
+        key_secret = str(st.secrets["RAZORPAY_KEY_SECRET"]).strip()
+        if not key_id or not key_secret:
+            raise ValueError("Razorpay credentials are empty")
+        return razorpay.Client(auth=(key_id, key_secret))
+    except Exception as e:
+        st.error(
+            "Razorpay is not configured correctly. Add RAZORPAY_KEY_ID and "
+            "RAZORPAY_KEY_SECRET to Streamlit Secrets."
+        )
+        return None
+
+
+def get_razorpay_key_id():
+    try:
+        return str(st.secrets["RAZORPAY_KEY_ID"]).strip()
+    except Exception:
+        return ""
+
+
 # ============================================================
 # SESSION STATE
 # ============================================================
@@ -75,8 +93,6 @@ DEFAULT_SESSION_STATE = {
     "profile": None,
     "current_page": "Dashboard",
     "batch_results": None,
-    # Changing this nonce resets Streamlit's file uploader without a browser refresh.
-    "pdf_uploader_nonce": 0,
     "auth_restored": False,
     "auth_restore_attempts": 0,
     "auth_restore_pending": False,
@@ -95,17 +111,9 @@ DEFAULT_SESSION_STATE = {
     # after a full browser refresh/new Streamlit session.
     "supabase_access_token": None,
     "supabase_refresh_token": None,
-    # Lightweight per-session caches reduce repeated Supabase reads during
-    # Streamlit reruns and make navigation noticeably faster.
-    "inventory_cache": None,
-    "inventory_cache_company_id": None,
-    "inventory_cache_loaded_at": None,
-    "subscription_cache": None,
-    "subscription_cache_user_id": None,
-    "subscription_cache_loaded_at": None,
-    # Each generated Pick-Up List receives one stable ID. Inventory may be
-    # deducted only once for that specific list during the active session.
-    "deducted_pickup_lists": set(),
+    "razorpay_callback_checked": False,
+    "payment_link_url": None,
+    "payment_link_plan": None,
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -562,27 +570,6 @@ def get_company_id():
 # ============================================================
 
 def get_subscription_status():
-    user_id = get_current_user_id()
-    cached_status = st.session_state.get("subscription_cache")
-    cached_user_id = st.session_state.get("subscription_cache_user_id")
-    cached_at = st.session_state.get("subscription_cache_loaded_at")
-
-    if (
-        cached_status is not None
-        and cached_user_id == user_id
-        and cached_at is not None
-        and time.time() - float(cached_at) < SUBSCRIPTION_CACHE_SECONDS
-    ):
-        return cached_status
-
-    status = _get_subscription_status_uncached()
-    st.session_state.subscription_cache = status
-    st.session_state.subscription_cache_user_id = user_id
-    st.session_state.subscription_cache_loaded_at = time.time()
-    return status
-
-
-def _get_subscription_status_uncached():
     if is_admin():
         return {
             "access": True,
@@ -590,11 +577,10 @@ def _get_subscription_status_uncached():
             "reason": "Full administrator application access",
         }
 
-    user_id = get_current_user_id()
-
     # Subscription access belongs to the authenticated user. A missing
     # company profile must not break login or subscription checks.
     profile = st.session_state.get("profile") or {}
+    user_id = get_current_user_id()
 
     if not user_id:
         return {
@@ -632,11 +618,13 @@ def _get_subscription_status_uncached():
         if (
             status in {"paid", "completed", "success"}
             and plan == "monthly"
-            and payment.get("created_at")
+            and (payment.get("paid_at") or payment.get("created_at"))
         ):
             try:
                 payment_date = datetime.fromisoformat(
-                    str(payment["created_at"]).replace("Z", "+00:00")
+                    str(
+                        payment.get("paid_at") or payment.get("created_at")
+                    ).replace("Z", "+00:00")
                 )
                 expiry = payment_date + timedelta(days=30)
 
@@ -694,7 +682,6 @@ def start_demo():
             .execute()
         )
         refresh_profile()
-        invalidate_subscription_cache()
         return True
     except Exception as e:
         st.error(f"Could not start demo: {e}")
@@ -838,10 +825,6 @@ def logout():
         "auth_restore_attempts", "auth_restore_pending",
         "auth_restore_started_at", "auth_cookie_seen",
         "auth_component_ready", "auth_cookie_checked_once",
-        "inventory_cache", "inventory_cache_company_id",
-        "inventory_cache_loaded_at", "subscription_cache",
-        "subscription_cache_user_id", "subscription_cache_loaded_at",
-        "deducted_pickup_lists",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -860,49 +843,11 @@ def logout():
 # MASTER PRODUCT DATABASE FUNCTIONS
 # ============================================================
 
-INVENTORY_CACHE_SECONDS = 20
-SUBSCRIPTION_CACHE_SECONDS = 30
-
-def invalidate_inventory_cache():
-    st.session_state.inventory_cache = None
-    st.session_state.inventory_cache_company_id = None
-    st.session_state.inventory_cache_loaded_at = None
-
-def invalidate_subscription_cache():
-    st.session_state.subscription_cache = None
-    st.session_state.subscription_cache_user_id = None
-    st.session_state.subscription_cache_loaded_at = None
-
-def get_inventory(force_refresh=False):
-    """Load the company's Master Products, optionally bypassing the UI cache.
-
-    ``force_refresh`` is used immediately after a product is created, edited or
-    deleted so the current Streamlit page can show the database's newest state without requiring the user to manually refresh the browser.
-    """
+def get_inventory():
     company_id = get_company_id()
 
     if not company_id:
         return []
-
-    cached_company_id = st.session_state.get(
-        "inventory_cache_company_id"
-    )
-    cached_at = st.session_state.get(
-        "inventory_cache_loaded_at"
-    )
-    cached_inventory = st.session_state.get(
-        "inventory_cache"
-    )
-
-    if (
-        not force_refresh
-        and cached_inventory is not None
-        and cached_company_id == company_id
-        and cached_at is not None
-        and time.time() - float(cached_at)
-        < INVENTORY_CACHE_SECONDS
-    ):
-        return cached_inventory
 
     try:
         response = (
@@ -912,14 +857,11 @@ def get_inventory(force_refresh=False):
             .order("product_name")
             .execute()
         )
-        inventory = response.data or []
-        st.session_state.inventory_cache = inventory
-        st.session_state.inventory_cache_company_id = company_id
-        st.session_state.inventory_cache_loaded_at = time.time()
-        return inventory
+        return response.data or []
     except Exception as e:
         st.error(f"Inventory loading error: {e}")
         return []
+
 
 def add_master_product(product_name, inventory_quantity, minimum_stock):
     try:
@@ -936,7 +878,6 @@ def add_master_product(product_name, inventory_quantity, minimum_stock):
             )
             .execute()
         )
-        invalidate_inventory_cache()
         return response is not None
     except Exception as e:
         st.error(f"Could not add product: {e}")
@@ -965,7 +906,6 @@ def update_master_product(
             .eq("company_id", get_company_id())
             .execute()
         )
-        invalidate_inventory_cache()
         return response
 
     except Exception as e:
@@ -1011,7 +951,6 @@ def delete_master_product(product_id, product_name):
             .eq("company_id", company_id)
             .execute()
         )
-        invalidate_inventory_cache()
         return True
     except Exception as e:
         st.error(f"Could not delete Master Product: {e}")
@@ -1068,7 +1007,6 @@ def update_inventory(product_id, new_quantity, reason=None):
         except Exception:
             pass
 
-        invalidate_inventory_cache()
         return True
 
     except Exception as e:
@@ -1218,15 +1156,12 @@ def _normalize_mapping_row(row, sku_column=None, master_column=None):
 
 
 def get_user_mappings():
-    """Load every accessible saved exact SKU -> Master Product mapping.
+    """Load and fully resolve every saved SKU → Master Product mapping.
 
-    Mappings are remembered by the *literal extracted SKU text*.  We deliberately
-    do not lowercase, trim, or otherwise normalize the SKU because capitalization,
-    spaces, hyphens and underscores are significant for automatic reuse.
-
-    Older versions of this application have stored mappings using either
-    ``user_id`` or ``company_id`` ownership.  To keep previously approved
-    mappings working, both ownership scopes are loaded and merged when available.
+    A mapping table can store either a Master Product name or a
+    ``master_product_id``. The UI and PDF matcher must always receive the
+    actual Master Product name, so ID-based mappings are resolved against the
+    current company's master_products before they are returned.
     """
     company_id = get_company_id()
     user_id = get_current_user_id()
@@ -1237,48 +1172,20 @@ def get_user_mappings():
         return []
 
     try:
-        rows = []
-        seen_row_ids = set()
+        query = supabase.table("sku_mappings").select("*")
+        # Prefer user ownership when that column exists. If an older mapping
+        # row is company-owned, a second company query below can still recover
+        # it instead of making an already-approved SKU disappear.
+        if _sku_mappings_has_user_id() and user_id:
+            query = query.eq("user_id", user_id)
+        elif company_id:
+            query = query.eq("company_id", company_id)
 
-        def add_rows(query):
-            try:
-                for raw in list(query.execute().data or []):
-                    row_id = raw.get("id") if isinstance(raw, dict) else None
-                    marker = str(row_id) if row_id not in (None, "") else repr(raw)
-                    if marker not in seen_row_ids:
-                        seen_row_ids.add(marker)
-                        rows.append(dict(raw or {}))
-            except Exception:
-                # A schema/RLS configuration can make one ownership filter
-                # unavailable. The other query can still recover valid rows.
-                pass
+        rows = list(query.execute().data or [])
 
-        has_user_id = _sku_mappings_has_user_id()
-
-        if has_user_id and user_id:
-            add_rows(
-                supabase.table("sku_mappings")
-                .select("*")
-                .eq("user_id", user_id)
-            )
-
-        if company_id:
-            add_rows(
-                supabase.table("sku_mappings")
-                .select("*")
-                .eq("company_id", company_id)
-            )
-
-        # Last-resort query for installations whose table does not expose the
-        # expected ownership columns through the client schema.
-        if not rows:
-            add_rows(supabase.table("sku_mappings").select("*"))
-
-        # Always use a fresh Master Product lookup while resolving mappings.
-        # This prevents a recently created product from leaving an otherwise
-        # valid master_product_id mapping unresolved because of the short UI
-        # inventory cache.
-        inventory = get_inventory(force_refresh=True)
+        # Build ID → name lookup once. This is the critical step for schemas
+        # whose sku_mappings table stores master_product_id.
+        inventory = get_inventory()
         product_id_to_name = {
             str(product.get("id")): get_master_product_name(product)
             for product in inventory
@@ -1313,6 +1220,8 @@ def get_user_mappings():
             if not master_name and master_id not in (None, ""):
                 master_name = product_id_to_name.get(str(master_id), "")
 
+            # If the product was not included in the initial inventory lookup,
+            # make one direct lookup before treating the mapping as unresolved.
             if not master_name and master_id not in (None, ""):
                 try:
                     product_query = (
@@ -1331,25 +1240,24 @@ def get_user_mappings():
                 except Exception:
                     pass
 
-            # Preserve the stored SKU literally. Do not strip it: the exact
-            # character sequence is the key for remembered mappings.
             row["sku"] = str(sku or "")
             row["master_product_name"] = str(master_name or "").strip()
             row["master_product_id"] = master_id
 
-            if row["sku"] and row["master_product_name"]:
+            if row["sku"]:
                 mappings.append(row)
 
-        # One usable mapping per literal SKU. Prefer the newest mapping while
-        # retaining exact character-sensitive matching.
+        # Keep the newest usable mapping for every exact SKU string. A usable
+        # resolved Master Product always wins over an older broken/empty row.
         deduplicated = {}
         for mapping in mappings:
             key = normalize_sku_key(mapping.get("sku"))
-            if key == "":
+            if not key:
                 continue
             previous = deduplicated.get(key)
             if (
                 previous is None
+                or (not previous.get("master_product_name") and mapping.get("master_product_name"))
                 or str(mapping.get("created_at", "")) >= str(previous.get("created_at", ""))
             ):
                 deduplicated[key] = mapping
@@ -1526,23 +1434,12 @@ def extract_product_section(page_text):
 
 
 def parse_product_details(page_text):
-    """Extract the SKU, Size, Qty and Color from a Meesho Product Details table.
+    """Extract the explicitly labelled SKU, Size, Qty and Color fields.
 
-    Meesho labels visually show five columns:
-        SKU | Size | Qty | Color | Order No.
-
-    PyMuPDF usually extracts those columns vertically rather than as one table
-    row. The SKU can also wrap across several lines. Therefore this parser reads
-    the Product Details block structurally from the bottom upward:
-
-        <SKU lines...>
-        <Size>
-        <Qty>
-        <Color>
-        <Order No.>
-
-    Only the text in the SKU column is returned as ``sku``. Size, quantity and
-    color are removed from it and stored in their own fields.
+    Meesho labels can contain a long Order No./product description elsewhere on
+    the page. That text is *not* the SKU. When a Product Details block contains
+    labelled fields, the value immediately associated with ``SKU`` is used as
+    the SKU, while Size, Qty and Color are extracted independently.
     """
     section = extract_product_section(page_text)
 
@@ -1557,101 +1454,116 @@ def parse_product_details(page_text):
     if not section:
         return result
 
-    lines = [
+    # Preserve line boundaries because the PDF often renders fields as:
+    # Product Details / SKU / <exact SKU> / Size / <size> / Qty / <qty> / Color / <color>
+    raw_lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in section.splitlines()
         if re.sub(r"\s+", " ", line).strip()
     ]
 
-    header_labels = {
-        "sku", "size", "qty", "quantity", "color", "colour",
-        "order no.", "order no", "order number",
-    }
+    field_names = {"sku", "size", "qty", "quantity", "color", "colour"}
 
-    while lines and lines[0].lower().strip().rstrip(":") in header_labels:
-        lines.pop(0)
+    def value_after_label(labels):
+        labels = tuple(label.lower() for label in labels)
 
-    if lines and re.search(
-        r"\bSKU\b.*\bSize\b.*\b(?:Qty|Quantity)\b.*\b(?:Color|Colour)\b",
-        lines[0], flags=re.I,
-    ):
-        lines.pop(0)
+        for index, line in enumerate(raw_lines):
+            compact = line.strip()
+            lower = compact.lower().rstrip(":-").strip()
 
-    known_colors = [
-        "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
-        "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
-        "Black", "White", "Red", "Blue", "Green", "Yellow", "Orange",
-        "Pink", "Purple", "Brown", "Grey", "Gray", "Gold", "Silver",
-        "Maroon", "Beige", "Cream",
-    ]
-    color_lookup = {color.lower(): color for color in known_colors}
+            # Label and value on the same line, e.g. SKU: Royal Ring GFR 002
+            for label in labels:
+                inline = re.match(
+                    rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
+                    compact,
+                    flags=re.I,
+                )
+                if inline:
+                    value = inline.group(1).strip()
+                    if value:
+                        return value
 
-    size_pattern = (
-        r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
-        r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
-    )
+            # Label on its own line; use the next non-label line exactly as shown.
+            if lower in labels:
+                for next_index in range(index + 1, len(raw_lines)):
+                    candidate = raw_lines[next_index]
+                    candidate_lower = candidate.lower().rstrip(":-").strip()
+                    if candidate_lower in field_names:
+                        continue
+                    return candidate
 
-    # Remove Order No. from the right side of the table.
-    if lines:
-        compact_last = lines[-1].replace(" ", "")
-        if re.fullmatch(r"\d{10,}(?:[_-]\d+)?", compact_last):
-            lines.pop()
-        else:
-            lines[-1] = re.sub(
-                r"\s+\d{10,}(?:[_-]\d+)?\s*$", "", lines[-1]
-            ).strip()
-            if not lines[-1]:
-                lines.pop()
+        # Fallback for text extraction that places all fields on one line.
+        flat = "\n".join(raw_lines)
+        for label in labels:
+            match = re.search(
+                rf"\b{re.escape(label)}\b\s*[:\-]?\s*(.+?)(?=\n\s*(?:SKU|Size|Qty|Quantity|Color|Colour)\b|$)",
+                flat,
+                flags=re.I | re.S,
+            )
+            if match:
+                value = re.sub(r"\s+", " ", match.group(1)).strip()
+                if value:
+                    return value
+        return ""
 
-    # Read Color, Qty and Size from the remaining rightmost values.
-    if lines and lines[-1].lower() in color_lookup:
-        result["color"] = lines.pop()
+    # Priority: explicitly labelled values. SKU is intentionally not derived
+    # from Order No. or the long product description.
+    result["sku"] = value_after_label(("SKU",))
+    result["size"] = value_after_label(("Size",))
+    qty_value = value_after_label(("Qty", "Quantity"))
+    result["color"] = value_after_label(("Color", "Colour"))
 
-    if lines and re.fullmatch(r"\d{1,4}", lines[-1]):
-        result["qty"] = max(1, int(lines.pop()))
-
-    if lines and re.fullmatch(size_pattern, lines[-1], flags=re.I):
-        result["size"] = re.sub(r"\s+", " ", lines.pop()).strip()
-
-    # Everything left is exactly the SKU column, including any wrapped lines.
-    if lines:
-        result["sku"] = " ".join(lines).strip()
-
-    # Fallback for PDF layouts that flatten the whole table onto one line.
-    if not result["sku"]:
-        flat = re.sub(
-            r"SKU\s+Size\s+(?:Qty|Quantity)\s+(?:Color|Colour)"
-            r"(?:\s+Order\s*No\.?)?",
-            "", section, flags=re.I,
-        )
-        flat = re.sub(r"\s+", " ", flat).strip()
-        flat = re.sub(r"\s+\d{10,}(?:[_-]\d+)?\s*$", "", flat).strip()
-
-        color_pattern = "|".join(
-            re.escape(color) for color in sorted(known_colors, key=len, reverse=True)
-        )
-        color_match = re.search(rf"\s+({color_pattern})\s*$", flat, flags=re.I)
-        if color_match:
-            result["color"] = result["color"] or re.sub(
-                r"\s+", " ", color_match.group(1)
-            ).strip()
-            flat = flat[:color_match.start()].rstrip()
-
-        qty_match = re.search(r"\s+(\d{1,4})\s*$", flat)
+    if qty_value:
+        qty_match = re.search(r"\d+", qty_value)
         if qty_match:
-            result["qty"] = max(1, int(qty_match.group(1)))
-            flat = flat[:qty_match.start()].rstrip()
+            result["qty"] = max(1, int(qty_match.group(0)))
 
-        size_match = re.search(rf"\s+({size_pattern})\s*$", flat, flags=re.I)
+    # If a particular PDF layout does not expose separate labels, retain the
+    # older right-to-left table parsing only as a fallback.
+    if not result["sku"]:
+        text = re.sub(r"SKU\s+Size\s+Qty\s+Color", "", section, flags=re.I)
+        working = re.sub(r"\s+", " ", text).strip()
+
+        known_colors = [
+            "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
+            "Dark Blue", "Sky Blue", "Navy Blue", "Bottle Green",
+            "Sea Green", "Off White", "Black", "White", "Red", "Blue",
+            "Green", "Yellow", "Orange", "Pink", "Purple", "Brown",
+            "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
+        ]
+        color_pattern = "|".join(
+            re.escape(color)
+            for color in sorted(known_colors, key=len, reverse=True)
+        )
+
+        color_match = re.search(
+            rf"\b({color_pattern})\s*$", working, flags=re.I
+        )
+        if color_match:
+            if not result["color"]:
+                result["color"] = re.sub(r"\s+", " ", color_match.group(1)).strip()
+            working = working[:color_match.start()].strip()
+
+        qty_match = re.search(r"\b(\d{1,4})\s*$", working)
+        if qty_match:
+            if not qty_value:
+                result["qty"] = max(1, int(qty_match.group(1)))
+            working = working[:qty_match.start()].strip()
+
+        size_pattern = (
+            r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
+            r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
+        )
+        size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
         if size_match:
-            result["size"] = result["size"] or re.sub(
-                r"\s+", " ", size_match.group(1)
-            ).strip()
-            flat = flat[:size_match.start()].rstrip()
+            if not result["size"]:
+                result["size"] = re.sub(r"\s+", " ", size_match.group(1)).strip()
+            working = working[:size_match.start()].strip()
 
-        result["sku"] = flat.strip()
+        result["sku"] = re.sub(r"\s+", " ", working).strip()
 
     return result
+
 
 # ============================================================
 # AUTOMATIC MASTER PRODUCT MATCHING
@@ -1781,9 +1693,8 @@ def find_matching_master_product(
        the best possible Master Product suggestions and wait for the user's
        decision.
     3. Once the user explicitly assigns a SKU to a Master Product, that exact
-       literal SKU mapping is saved and will be reused automatically in
-       future uploads. Capitalization, spaces, underscores and hyphens remain
-       significant.
+       normalized SKU mapping is saved and will be reused automatically in
+       future uploads. Matching ignores case, underscores and hyphens.
     """
     sku = str(extracted.get("sku", "") or "")
     sku_norm = normalize_sku_key(sku)
@@ -1902,7 +1813,7 @@ def reorganize_pdfs(uploaded_files):
     # the authenticated Supabase session on this Streamlit rerun.
     sync_supabase_auth_from_cookie()
     mappings = get_user_mappings()
-    master_products = get_inventory(force_refresh=True)
+    master_products = get_inventory()
 
     categorized_pages = {}
     uncategorized_pages = []
@@ -2048,67 +1959,6 @@ def reorganize_pdfs(uploaded_files):
     }
 
 
-def refresh_batch_master_product_choices(
-    results,
-    newly_created_product=None,
-):
-    """Refresh Master Product choices without losing the extracted PDF batch.
-
-    Streamlit reruns the script after a button click, but ``batch_results`` is
-    deliberately kept in session state. This helper reloads Master Products
-    from Supabase and updates every still-open review item in the current batch
-    so a product created moments ago is immediately available for assignment.
-    """
-    fresh_products = get_inventory(force_refresh=True)
-    fresh_names = [
-        get_master_product_name(product)
-        for product in fresh_products
-        if get_master_product_name(product)
-    ]
-
-    # Preserve exact database spelling while preventing duplicate choices.
-    seen = set()
-    fresh_names = [
-        name for name in fresh_names
-        if not (
-            normalize_text(name) in seen
-            or seen.add(normalize_text(name))
-        )
-    ]
-
-    if newly_created_product:
-        new_name = str(newly_created_product).strip()
-        if (
-            new_name
-            and normalize_text(new_name)
-            not in {normalize_text(name) for name in fresh_names}
-        ):
-            fresh_names.append(new_name)
-
-    for review in results.get("review_candidates", {}).values():
-        existing_candidates = review.get("candidates", []) or []
-        existing_by_name = {
-            normalize_text(str(candidate.get("name", ""))): candidate
-            for candidate in existing_candidates
-            if candidate.get("name")
-        }
-
-        refreshed_candidates = list(existing_candidates)
-        for name in fresh_names:
-            key = normalize_text(name)
-            if key not in existing_by_name:
-                # A newly created product has no similarity score until the
-                # next extraction. It is still a valid manual assignment and
-                # must therefore appear immediately in the current list.
-                refreshed_candidates.append(
-                    {"name": name, "score": 0.0}
-                )
-
-        review["candidates"] = refreshed_candidates
-
-    return results
-
-
 def apply_review_assignment(
     results,
     sku,
@@ -2175,10 +2025,6 @@ def apply_review_assignment(
         None,
     )
 
-    # A manual assignment changes the organization, so invalidate any PDF
-    # bytes cached from an earlier version of this batch.
-    results.pop("reorganized_pdf_bytes", None)
-
     return True
 
 
@@ -2235,14 +2081,8 @@ def create_pickup_list(categorized_pages):
     return dataframe
 
 
-def deduct_inventory_from_pickup(pickup_dataframe, pickup_list_id=None):
-    """Deduct one Pick-Up List and record each deduction as a sale event.
-
-    Negative inventory-history entries created here are the single source of
-    truth for the Sales Reports page. The reason includes the stable Pick-Up
-    List ID so future reports can be traced back to the exact batch.
-    """
-    inventory = get_inventory(force_refresh=True)
+def deduct_inventory_from_pickup(pickup_dataframe):
+    inventory = get_inventory()
 
     inventory_lookup = {
         normalize_text(product.get("product_name")): product
@@ -2251,190 +2091,39 @@ def deduct_inventory_from_pickup(pickup_dataframe, pickup_list_id=None):
 
     successful = 0
     failed = []
-    pickup_reason = (
-        f"{PICKUP_DEDUCTION_REASON_PREFIX} | {pickup_list_id}"
-        if pickup_list_id
-        else PICKUP_DEDUCTION_REASON_PREFIX
-    )
 
     for _, row in pickup_dataframe.iterrows():
         product_name = str(row["Master Product"]).strip()
-        quantity_needed = int(row.get("Total Quantity", 0) or 0)
+        quantity_needed = int(
+            row.get("Total Quantity", 0) or 0
+        )
 
-        product = inventory_lookup.get(normalize_text(product_name))
+        product = inventory_lookup.get(
+            normalize_text(product_name)
+        )
 
         if not product:
-            failed.append(f"{product_name}: Master Product not found.")
+            failed.append(
+                f"{product_name}: Master Product not found."
+            )
             continue
 
-        current = int(product.get("inventory_quantity", 0) or 0)
+        current = int(
+            product.get("inventory_quantity", 0) or 0
+        )
 
         if update_inventory(
             product["id"],
             max(0, current - quantity_needed),
-            pickup_reason,
+            "Automatic deduction from organized PDF batch",
         ):
             successful += 1
         else:
-            failed.append(f"{product_name}: Inventory update failed.")
-
-    if successful:
-        # Refresh the product cache and automatically recalculate minimum stock
-        # from the latest rolling weekly sales after the deduction is recorded.
-        invalidate_inventory_cache()
-        update_automatic_minimum_stock_from_sales()
+            failed.append(
+                f"{product_name}: Inventory update failed."
+            )
 
     return successful, failed
-
-
-def _is_pickup_deduction_history_row(row):
-    """Return True only for inventory history produced by Pick-Up List sales."""
-    reason = str(row.get("reason", "") or "")
-    return (
-        reason.startswith(PICKUP_DEDUCTION_REASON_PREFIX)
-        or reason == LEGACY_PICKUP_DEDUCTION_REASON
-    )
-
-
-def get_pickup_sales_history(days=SALES_REPORT_MAX_DAYS):
-    """Load negative inventory changes caused specifically by Pick-Up Lists."""
-    company_id = get_company_id()
-    if not company_id:
-        return []
-
-    start_time = now_utc() - timedelta(days=max(1, int(days)))
-
-    try:
-        response = (
-            supabase.table("inventory_history")
-            .select("master_product_id, change_quantity, reason, created_at")
-            .eq("company_id", company_id)
-            .lt("change_quantity", 0)
-            .gte("created_at", start_time.isoformat())
-            .execute()
-        )
-        return [
-            row for row in (response.data or [])
-            if _is_pickup_deduction_history_row(row)
-        ]
-    except Exception as e:
-        st.error(f"Could not load Pick-Up List sales history: {e}")
-        return []
-
-
-def get_sales_by_master_product(days):
-    """Aggregate actual sales from Pick-Up List inventory deductions."""
-    inventory = get_inventory(force_refresh=True)
-    product_lookup = {
-        product.get("id"): product
-        for product in inventory
-        if product.get("id")
-    }
-
-    totals = {product_id: 0 for product_id in product_lookup}
-    for row in get_pickup_sales_history(days):
-        product_id = row.get("master_product_id")
-        if product_id in totals:
-            totals[product_id] += abs(int(row.get("change_quantity", 0) or 0))
-
-    rows = []
-    for product_id, product in product_lookup.items():
-        weekly_sales = totals.get(product_id, 0)
-        rows.append({
-            "Master Product": product.get("product_name", "Unnamed Product"),
-            "Sales": int(weekly_sales),
-            "Current Inventory": int(product.get("inventory_quantity", 0) or 0),
-            "Current Minimum Stock": int(product.get("minimum_stock", 0) or 0),
-            "Product ID": product_id,
-        })
-
-    return rows
-
-
-def get_sales_report_rows():
-    """Build a combined Daily / Weekly / Monthly sales report."""
-    inventory = get_inventory(force_refresh=True)
-    products = {
-        product.get("id"): product
-        for product in inventory
-        if product.get("id")
-    }
-
-    totals = {
-        1: {product_id: 0 for product_id in products},
-        7: {product_id: 0 for product_id in products},
-        30: {product_id: 0 for product_id in products},
-    }
-
-    histories = {
-        days: get_pickup_sales_history(days)
-        for days in (1, 7, 30)
-    }
-
-    for days, rows in histories.items():
-        for row in rows:
-            product_id = row.get("master_product_id")
-            if product_id in totals[days]:
-                totals[days][product_id] += abs(
-                    int(row.get("change_quantity", 0) or 0)
-                )
-
-    report_rows = []
-    for product_id, product in products.items():
-        weekly_sales = int(totals[7].get(product_id, 0))
-        # 5 days of stock based on the actual average daily sales from the last
-        # seven days. Always round up so the stock covers the full five days.
-        recommended_minimum = (
-            int(math.ceil((weekly_sales / 7) * MIN_STOCK_COVERAGE_DAYS))
-            if weekly_sales > 0 else 0
-        )
-
-        report_rows.append({
-            "Master Product": product.get("product_name", "Unnamed Product"),
-            "Daily Sales (Last 24h)": int(totals[1].get(product_id, 0)),
-            "Weekly Sales (Last 7 Days)": weekly_sales,
-            "Monthly Sales (Last 30 Days)": int(totals[30].get(product_id, 0)),
-            "Recommended Min Stock (5 Days)": recommended_minimum,
-            "Current Min Stock": int(product.get("minimum_stock", 0) or 0),
-            "Current Inventory": int(product.get("inventory_quantity", 0) or 0),
-            "Product ID": product_id,
-        })
-
-    return report_rows
-
-
-def update_automatic_minimum_stock_from_sales():
-    """Automatically set minimum stock from rolling 7-day Pick-Up List sales.
-
-    Existing minimum stock is never reduced automatically. This means a manual
-    safety limit is respected while fast-selling products are raised to at
-    least the amount needed for five days of sales.
-    """
-    report_rows = get_sales_report_rows()
-    changed = 0
-
-    for row in report_rows:
-        recommended = int(row["Recommended Min Stock (5 Days)"] or 0)
-        current_minimum = int(row["Current Min Stock"] or 0)
-        if recommended <= current_minimum:
-            continue
-
-        try:
-            (
-                supabase.table("master_products")
-                .update({"minimum_stock": recommended})
-                .eq("id", row["Product ID"])
-                .eq("company_id", get_company_id())
-                .execute()
-            )
-            changed += 1
-        except Exception:
-            pass
-
-    if changed:
-        invalidate_inventory_cache()
-
-    return changed
 
 
 # ============================================================
@@ -2902,29 +2591,6 @@ def show_sku_mappings():
 # PDF ORGANIZER PAGE
 # ============================================================
 
-def clear_current_pdf_batch():
-    """Clear the current extracted PDF batch while keeping the user on this page."""
-    st.session_state.batch_results = None
-
-    # Remove widget state created for the current review batch. This prevents
-    # old selectbox/text-input values from leaking into the next PDF upload.
-    widget_prefixes = (
-        "review_master_",
-        "assign_review_",
-        "new_master_",
-        "create_assign_",
-    )
-    for key in list(st.session_state.keys()):
-        if key.startswith(widget_prefixes):
-            del st.session_state[key]
-
-    # File uploaders cannot be directly cleared through session_state. Giving
-    # the uploader a new key removes the selected files on the next rerun.
-    st.session_state.pdf_uploader_nonce = (
-        st.session_state.get("pdf_uploader_nonce", 0) + 1
-    )
-
-
 def show_pdf_organizer():
     st.title("📄 PDF Label Organizer")
 
@@ -2966,30 +2632,10 @@ def show_pdf_organizer():
             )
             return
 
-    # Always keep the clear button visible at the top of the PDF Organizer.
-    # It must not depend on batch_results, otherwise it disappears after the
-    # current batch is cleared and a new PDF is selected.
-    clear_button_col, clear_info_col = st.columns([1, 3])
-    with clear_button_col:
-        if st.button(
-            "🗑️ Clear & Start Over",
-            key="clear_extracted_pdf_data_top",
-            type="secondary",
-            use_container_width=True,
-        ):
-            clear_current_pdf_batch()
-            st.rerun()
-    with clear_info_col:
-        st.caption(
-            "Clear the current upload and all extracted PDF data without leaving "
-            "this page. Saved Master Products, SKU mappings, and inventory are not deleted."
-        )
-
     uploaded_files = st.file_uploader(
         "Upload Meesho Label PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        key=f"pdf_uploader_{st.session_state.get('pdf_uploader_nonce', 0)}",
     )
 
     if uploaded_files and st.button(
@@ -3012,9 +2658,6 @@ def show_pdf_organizer():
         ):
             try:
                 results = reorganize_pdfs(uploaded_files)
-                # One stable identifier represents this exact generated
-                # Pick-Up List/batch for the remainder of the session.
-                results["pickup_list_id"] = str(uuid.uuid4())
                 st.session_state.batch_results = results
 
                 try:
@@ -3189,9 +2832,6 @@ def show_pdf_organizer():
                             selected_master,
                             "User-approved similar match",
                         ):
-                            refresh_batch_master_product_choices(
-                                results
-                            )
                             st.success(
                                 f"'{sku}' was assigned to "
                                 f"'{selected_master}'."
@@ -3242,23 +2882,6 @@ def show_pdf_organizer():
                                     )
                                     continue
 
-                                # Reload the Master Product list immediately
-                                # while keeping the current extracted PDF batch
-                                # in session state. The new product is added to
-                                # every remaining assignment dropdown before
-                                # this page reruns.
-                                refresh_batch_master_product_choices(
-                                    results,
-                                    new_master_name,
-                                )
-                            else:
-                                # The product already existed; still refresh
-                                # the current batch choices in case another
-                                # tab/session changed the Master Product list.
-                                refresh_batch_master_product_choices(
-                                    results
-                                )
-
                             if apply_review_assignment(
                                 results,
                                 sku,
@@ -3268,18 +2891,10 @@ def show_pdf_organizer():
                                     "and assigned"
                                 ),
                             ):
-                                refresh_batch_master_product_choices(
-                                    results,
-                                    new_master_name,
-                                )
                                 st.success(
                                     f"Created/used '{new_master_name}' "
                                     f"and assigned '{sku}'."
                                 )
-                                # Store the fully updated batch before the
-                                # Streamlit rerun. The extracted PDF data,
-                                # review state and newly created Master Product
-                                # therefore remain on the same page.
                                 st.session_state.batch_results = results
                                 st.rerun()
 
@@ -3368,75 +2983,35 @@ def show_pdf_organizer():
         st.subheader("📦 Inventory Action")
 
         st.warning(
-            "This subtracts the extracted Total Quantity from inventory. "
-            "For safety, each generated Pick-Up List can be deducted only once."
+            "This subtracts the extracted Total Quantity from inventory."
         )
 
-        pickup_list_id = results.get("pickup_list_id")
-        if not pickup_list_id:
-            pickup_list_id = str(uuid.uuid4())
-            results["pickup_list_id"] = pickup_list_id
-            st.session_state.batch_results = results
-
-        deducted_lists = st.session_state.get(
-            "deducted_pickup_lists", set()
-        )
-        already_deducted = pickup_list_id in deducted_lists
-
-        if already_deducted:
-            st.success(
-                "✓ Inventory has already been deducted for this Pick-Up List. "
-                "It cannot be deducted again by refreshing or revisiting this batch."
+        if st.button(
+            "➖ Deduct Pick-Up List From Inventory",
+            type="primary",
+        ):
+            success_count, failed = (
+                deduct_inventory_from_pickup(
+                    pickup_dataframe
+                )
             )
-        else:
-            if st.button(
-                "➖ Deduct Pick-Up List From Inventory",
-                type="primary",
-                key=f"deduct_pickup_{pickup_list_id}",
-            ):
-                # Mark this list as used before performing the updates so a
-                # rerun/double-click cannot deduct the same list twice.
-                deducted_lists = set(deducted_lists)
-                deducted_lists.add(pickup_list_id)
-                st.session_state.deducted_pickup_lists = deducted_lists
 
-                success_count, failed = (
-                    deduct_inventory_from_pickup(
-                        pickup_dataframe,
-                        pickup_list_id,
-                    )
+            if success_count:
+                st.success(
+                    f"Inventory updated for "
+                    f"{success_count} product(s)."
                 )
 
-                if success_count:
-                    st.success(
-                        f"Inventory updated for "
-                        f"{success_count} product(s). This Pick-Up List is now locked "
-                        "from further deductions."
-                    )
-
-                if failed:
-                    st.warning(
-                        "This Pick-Up List has still been locked to prevent duplicate "
-                        "stock deductions. The following products could not be updated:"
-                    )
-                    for error in failed:
-                        st.error(error)
-
-                st.rerun()
+            for error in failed:
+                st.error(error)
 
     st.subheader("📄 Download Reorganized Labels")
 
     if categorized or uncategorized:
-        # Building the PDF is relatively expensive. Keep the generated bytes
-        # with the current batch instead of rebuilding them on every rerun.
-        output_pdf = results.get("reorganized_pdf_bytes")
-        if output_pdf is None:
-            output_pdf = create_reorganized_pdf(
-                categorized,
-                uncategorized,
-            )
-            results["reorganized_pdf_bytes"] = output_pdf
-            st.session_state.batch_results = results
+        output_pdf = create_reorganized_pdf(
+            categorized,
+            uncategorized,
+        )
 
         st.download_button(
             "⬇️ Download Reorganized PDF",
@@ -3469,258 +3044,323 @@ def show_inventory():
         )
         return
 
-    # Streamlit's selectbox supports searching by typing, making it much easier
-    # to manage inventory when the company has a large number of Master Products.
-    inventory = sorted(
-        inventory,
-        key=lambda product: str(
-            product.get("product_name") or ""
-        ).lower(),
-    )
+    for product in inventory:
+        product_id = product["id"]
 
-    product_options = {
-        str(product.get("product_name") or "Unnamed Product"): product
-        for product in inventory
-    }
-
-    # Protect against duplicate Master Product names so every dropdown option
-    # still points to the correct database record.
-    if len(product_options) != len(inventory):
-        product_options = {}
-        for product in inventory:
-            product_id = str(product.get("id") or "")
-            product_name = str(
-                product.get("product_name") or "Unnamed Product"
-            )
-            label = f"{product_name} — {product_id[:8]}"
-            product_options[label] = product
-
-    selected_product_name = st.selectbox(
-        "🔎 Search or Select a Master Product",
-        options=list(product_options.keys()),
-        index=None,
-        placeholder="Type a Master Product name to search...",
-        key="inventory_master_product_search",
-    )
-
-    if not selected_product_name:
-        st.info(
-            "Search for and select a Master Product to view or update its stock."
-        )
-        return
-
-    product = product_options[selected_product_name]
-    product_id = product["id"]
-    name = (
-        product.get("product_name")
-        or "Unnamed Product"
-    )
-
-    current_quantity = int(
-        product.get("inventory_quantity", 0) or 0
-    )
-
-    minimum_stock = int(
-        product.get("minimum_stock", 0) or 0
-    )
-
-    st.subheader(f"📦 {name}")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        new_quantity = st.number_input(
-            "Current Quantity",
-            min_value=0,
-            value=current_quantity,
-            step=1,
-            key=f"inventory_quantity_{product_id}",
+        name = (
+            product.get("product_name")
+            or "Unnamed Product"
         )
 
-    with col2:
-        new_minimum = st.number_input(
-            "Minimum Stock Limit",
-            min_value=0,
-            value=minimum_stock,
-            step=1,
-            key=f"inventory_minimum_{product_id}",
+        current_quantity = int(
+            product.get("inventory_quantity", 0) or 0
         )
 
-    if st.button(
-        "💾 Save Inventory Changes",
-        key=f"save_inventory_{product_id}",
-        type="primary",
-    ):
-        try:
-            (
-                supabase.table("master_products")
-                .update(
-                    {
-                        "inventory_quantity": int(new_quantity),
-                        "minimum_stock": int(new_minimum),
-                    }
-                )
-                .eq("id", product_id)
-                .eq(
-                    "company_id",
-                    get_company_id(),
-                )
-                .execute()
-            )
-
-            # Clear the cached inventory so the newly saved values are shown
-            # immediately without a manual browser refresh.
-            invalidate_inventory_cache()
-            get_inventory(force_refresh=True)
-
-            st.success(
-                f"Inventory for '{name}' updated successfully!"
-            )
-            st.rerun()
-
-        except Exception as e:
-            st.error(
-                f"Could not update inventory: {e}"
-            )
-
-
-# ============================================================
-# SALES REPORTS PAGE
-# ============================================================
-
-def show_sales_reports():
-    st.title("📊 Sales & Stock Reports")
-    st.caption(
-        "Sales are calculated only from inventory deductions made through "
-        "Pick-Up Lists. Manual inventory changes are not counted as sales."
-    )
-
-    report_rows = get_sales_report_rows()
-
-    if not report_rows:
-        st.info("No Master Products are available yet.")
-        return
-
-    report_df = pd.DataFrame(report_rows)
-    total_daily = int(report_df["Daily Sales (Last 24h)"].sum())
-    total_weekly = int(report_df["Weekly Sales (Last 7 Days)"].sum())
-    total_monthly = int(report_df["Monthly Sales (Last 30 Days)"].sum())
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📅 Daily Sales", total_daily)
-    col2.metric("📆 Weekly Sales", total_weekly)
-    col3.metric("🗓️ Monthly Sales", total_monthly)
-
-    st.divider()
-    st.subheader("📦 Sales by Master Product")
-
-    display_df = report_df.drop(columns=["Product ID"])
-    st.dataframe(
-        display_df.sort_values(
-            "Weekly Sales (Last 7 Days)",
-            ascending=False,
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-    st.subheader("⚙️ Automatic Minimum Stock")
-    st.info(
-        "Formula: Weekly sales ÷ 7 × 5 days, rounded up. "
-        "For example, 1,000 weekly orders recommends a minimum stock of 715 units."
-    )
-
-    needs_update = report_df[
-        report_df["Recommended Min Stock (5 Days)"]
-        > report_df["Current Min Stock"]
-    ]
-
-    if needs_update.empty:
-        st.success(
-            "All current minimum stock limits already cover at least five days "
-            "of recent weekly sales."
-        )
-    else:
-        st.warning(
-            f"{len(needs_update)} product(s) have a minimum stock below the "
-            "recommended five-day level."
-        )
-        st.dataframe(
-            needs_update.drop(columns=["Product ID"]),
-            use_container_width=True,
-            hide_index=True,
+        minimum_stock = int(
+            product.get("minimum_stock", 0) or 0
         )
 
-        if st.button(
-            "⚡ Update Minimum Stock Automatically",
-            type="primary",
-            use_container_width=True,
+        with st.expander(
+            f"📦 {name}",
+            expanded=False,
         ):
-            changed = update_automatic_minimum_stock_from_sales()
-            invalidate_inventory_cache()
-            if changed:
-                st.success(
-                    f"Updated the minimum stock for {changed} Master Product(s)."
-                )
-            else:
-                st.info("No minimum stock changes were required.")
-            st.rerun()
+            col1, col2 = st.columns(2)
 
-    st.caption(
-        "Automatic updates are also checked after every successful Pick-Up List "
-        "inventory deduction. Existing higher manual minimum-stock limits are "
-        "not automatically lowered."
-    )
+            with col1:
+                new_quantity = st.number_input(
+                    "Current Quantity",
+                    min_value=0,
+                    value=current_quantity,
+                    step=1,
+                    key=f"inventory_quantity_{product_id}",
+                )
+
+            with col2:
+                new_minimum = st.number_input(
+                    "Minimum Stock Limit",
+                    min_value=0,
+                    value=minimum_stock,
+                    step=1,
+                    key=f"inventory_minimum_{product_id}",
+                )
+
+            if st.button(
+                "💾 Save Inventory Changes",
+                key=f"save_inventory_{product_id}",
+            ):
+                try:
+                    (
+                        supabase.table("master_products")
+                        .update(
+                            {
+                                "inventory_quantity": int(new_quantity),
+                                "minimum_stock": int(new_minimum),
+                            }
+                        )
+                        .eq("id", product_id)
+                        .eq(
+                            "company_id",
+                            get_company_id(),
+                        )
+                        .execute()
+                    )
+
+                    st.success(
+                        "Inventory updated successfully!"
+                    )
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(
+                        f"Could not update inventory: {e}"
+                    )
 
 
 # ============================================================
 # SUBSCRIPTION PAGE
 # ============================================================
 
-def create_payment_record(plan, amount):
+def _payment_reference(plan):
+    user_id = str(get_current_user_id() or "guest")[:8]
+    return f"MLO-{plan.upper()}-{user_id}-{uuid.uuid4().hex[:12]}"
+
+
+def create_payment_record(plan, amount, reference_id):
+    """Create a pending local payment row before opening Razorpay."""
+    payload = {
+        "user_id": get_current_user_id(),
+        "company_id": get_company_id(),
+        "plan": plan,
+        "amount": int(amount),
+        "status": "pending",
+        "razorpay_reference_id": reference_id,
+    }
+    try:
+        response = supabase.table("payments").insert(payload).execute()
+        return (response.data or [{}])[0]
+    except Exception as e:
+        st.error(
+            "Could not create the payment record. Make sure the required Razorpay "
+            "columns have been added to the payments table. "
+            f"Details: {e}"
+        )
+        return None
+
+
+def update_payment_record(reference_id, updates):
     try:
         (
             supabase.table("payments")
-            .insert(
-                {
-                    "user_id": get_current_user_id(),
-                    "company_id": get_company_id(),
-                    "plan": plan,
-                    "amount": amount,
-                    "status": "pending",
-                }
-            )
+            .update(updates)
+            .eq("razorpay_reference_id", reference_id)
+            .eq("user_id", get_current_user_id())
             .execute()
         )
+        return True
+    except Exception as e:
+        st.error(f"Could not update the payment record: {e}")
+        return False
 
-        st.info(
-            "Payment record created. Connect a real payment gateway "
-            "before treating this as a completed payment."
+
+def create_razorpay_payment_link(plan, amount, description):
+    """Create a Razorpay-hosted payment page for the logged-in user."""
+    client = get_razorpay_client()
+    if client is None:
+        return None
+
+    user = st.session_state.get("user")
+    profile = st.session_state.get("profile") or {}
+    email = str(getattr(user, "email", "") or "").strip()
+    name = str(profile.get("company_name") or email or "Meesho Label Organizer User")
+    reference_id = _payment_reference(plan)
+
+    payment_row = create_payment_record(plan, amount, reference_id)
+    if payment_row is None:
+        return None
+
+    try:
+        link = client.payment_link.create(
+            {
+                "amount": int(amount) * 100,
+                "currency": "INR",
+                "accept_partial": False,
+                "description": description,
+                "reference_id": reference_id,
+                "customer": {
+                    "name": name,
+                    "email": email,
+                },
+                "notify": {"sms": False, "email": True},
+                "reminder_enable": True,
+                "callback_url": APP_URL,
+                "callback_method": "get",
+            }
         )
+
+        link_id = link.get("id")
+        short_url = link.get("short_url")
+
+        if not link_id or not short_url:
+            raise ValueError("Razorpay did not return a payment link")
+
+        if not update_payment_record(
+            reference_id,
+            {
+                "razorpay_payment_link_id": link_id,
+                "razorpay_payment_link_url": short_url,
+            },
+        ):
+            return None
+
+        st.session_state.payment_link_url = short_url
+        st.session_state.payment_link_plan = plan
+        return short_url
 
     except Exception as e:
-        st.error(
-            f"Payment initialization failed: {e}"
+        update_payment_record(reference_id, {"status": "failed"})
+        st.error(f"Could not create the Razorpay payment link: {e}")
+        return None
+
+
+def verify_razorpay_callback():
+    """Verify a Razorpay Payment Link callback before granting access.
+
+    Razorpay redirects the user back to APP_URL with signed payment parameters.
+    The signature is verified with the server-only Key Secret and the payment
+    record is marked paid only after both verification and a successful link
+    status check.
+    """
+    params = dict(st.query_params)
+    link_id = str(params.get("razorpay_payment_link_id", "") or "")
+    payment_id = str(params.get("razorpay_payment_id", "") or "")
+    reference_id = str(
+        params.get("razorpay_payment_link_reference_id", "") or ""
+    )
+    status = str(params.get("razorpay_payment_link_status", "") or "").lower()
+    signature = str(params.get("razorpay_signature", "") or "")
+
+    if not link_id or not reference_id:
+        return False
+
+    client = get_razorpay_client()
+    if client is None:
+        return False
+
+    if status != "paid" or not payment_id or not signature:
+        update_payment_record(
+            reference_id,
+            {
+                "status": "failed" if status in {"cancelled", "expired", "failed"} else "pending",
+                "razorpay_payment_link_id": link_id,
+            },
         )
+        return False
+
+    try:
+        verification_payload = {
+            "razorpay_payment_id": payment_id,
+            "razorpay_payment_link_id": link_id,
+            "razorpay_payment_link_reference_id": reference_id,
+            "razorpay_payment_link_status": status,
+            "razorpay_signature": signature,
+        }
+        client.utility.verify_payment_link_signature(verification_payload)
+
+        # Independently fetch the link from Razorpay before granting access.
+        link = client.payment_link.fetch(link_id)
+        if str(link.get("status", "")).lower() != "paid":
+            raise ValueError("Razorpay payment link is not marked paid")
+
+        update_payment_record(
+            reference_id,
+            {
+                "status": "paid",
+                "razorpay_payment_id": payment_id,
+                "razorpay_payment_link_id": link_id,
+                "paid_at": now_utc().isoformat(),
+            },
+        )
+
+        # Remove payment callback parameters so refreshing the app does not
+        # repeatedly process the same successful payment.
+        st.query_params.clear()
+        st.session_state.payment_link_url = None
+        st.session_state.payment_link_plan = None
+        st.success("Payment verified successfully. Your access is now active!")
+        return True
+
+    except Exception as e:
+        st.error(f"Payment verification failed: {e}")
+        return False
+
+
+def check_pending_payment_links():
+    """Allow users to manually re-check a pending payment link safely."""
+    client = get_razorpay_client()
+    if client is None:
+        return None
+
+    user_id = get_current_user_id()
+    if not user_id:
+        return None
+
+    try:
+        response = (
+            supabase.table("payments")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            return None
+
+        row = rows[0]
+        link_id = row.get("razorpay_payment_link_id")
+        reference_id = row.get("razorpay_reference_id")
+        if not link_id or not reference_id:
+            return row
+
+        link = client.payment_link.fetch(link_id)
+        razorpay_status = str(link.get("status", "")).lower()
+        if razorpay_status == "paid":
+            payments = link.get("payments") or []
+            payment_id = payments[-1].get("id") if payments else None
+            update_payment_record(
+                reference_id,
+                {
+                    "status": "paid",
+                    "razorpay_payment_id": payment_id,
+                    "paid_at": now_utc().isoformat(),
+                },
+            )
+            return {"verified_paid": True}
+
+        if razorpay_status in {"expired", "cancelled"}:
+            update_payment_record(reference_id, {"status": "failed"})
+
+        return row
+    except Exception as e:
+        st.error(f"Could not check the pending Razorpay payment: {e}")
+        return None
 
 
 def show_subscription_page():
     st.title("Choose Your Plan")
 
     if is_admin():
-        st.success(
-            "🛡️ Administrator account: complete application access "
-            "without a subscription."
-        )
+        st.success("🛡️ Administrator account: complete application access without a subscription.")
         return
 
+    # Process a verified Razorpay return before checking access.
+    verify_razorpay_callback()
     current_status = get_subscription_status()
 
     if current_status["access"]:
-        st.success(
-            f"Your {current_status['plan']} access is active."
-        )
+        st.success(f"Your {current_status['plan']} access is active.")
         st.info(current_status["reason"])
         return
 
@@ -3733,12 +3373,8 @@ def show_subscription_page():
         st.subheader("🆓 Demo")
         st.write(f"⏰ {DEMO_HOURS} hours access")
         st.write(f"📄 Maximum {DEMO_PDF_LIMIT} PDFs")
-
         if not demo_started:
-            if st.button(
-                "Start Free Demo",
-                use_container_width=True,
-            ):
+            if st.button("Start Free Demo", use_container_width=True):
                 if start_demo():
                     st.success("Demo started!")
                     st.rerun()
@@ -3748,30 +3384,62 @@ def show_subscription_page():
     with col2:
         st.subheader("💳 Monthly")
         st.markdown(f"## ₹{MONTHLY_PRICE}/month")
-
-        if st.button(
-            "Choose Monthly Plan",
-            use_container_width=True,
-            type="primary",
-        ):
-            create_payment_record(
+        st.caption("30 days of access after each successful payment.")
+        if st.button("Pay with Razorpay", use_container_width=True, type="primary", key="monthly_razorpay"):
+            create_razorpay_payment_link(
                 "monthly",
                 MONTHLY_PRICE,
+                "Meesho Label Organizer - Monthly Access",
             )
 
     with col3:
         st.subheader("💎 Lifetime")
+        st.caption("🎉 Special Offer")
+        st.markdown("~~₹9,999~~")
         st.markdown(f"## ₹{LIFETIME_PRICE}")
 
-        if st.button(
-            "Choose Lifetime Plan",
-            use_container_width=True,
-            type="primary",
-        ):
-            create_payment_record(
+        coupon = st.text_input(
+            "Lifetime coupon code (optional)",
+            key="lifetime_coupon",
+        ).strip()
+
+        lifetime_amount = LIFETIME_PRICE
+        coupon_applied = False
+        if coupon and coupon.upper() == LIFETIME_COUPON_CODE.upper():
+            discount = round(LIFETIME_PRICE * LIFETIME_COUPON_DISCOUNT_PERCENT / 100)
+            lifetime_amount = LIFETIME_PRICE - discount
+            coupon_applied = True
+            st.success(f"Coupon applied! {LIFETIME_COUPON_DISCOUNT_PERCENT}% off — pay ₹{lifetime_amount}.")
+        elif coupon:
+            st.error("Invalid lifetime coupon code.")
+
+        if st.button("Buy Lifetime Access", use_container_width=True, type="primary", key="lifetime_razorpay"):
+            create_razorpay_payment_link(
                 "lifetime",
-                LIFETIME_PRICE,
+                lifetime_amount,
+                "Meesho Label Organizer - Lifetime Access",
             )
+
+    payment_url = st.session_state.get("payment_link_url")
+    if payment_url:
+        st.divider()
+        st.subheader("Complete Your Payment")
+        st.info("Open the secure Razorpay payment page, complete the payment, and you will be redirected back to this app for verification.")
+        st.link_button(
+            "🔐 Open Secure Razorpay Payment Page",
+            payment_url,
+            type="primary",
+            use_container_width=True,
+        )
+
+        if st.button("🔄 I Have Paid — Verify Payment", use_container_width=True):
+            result = check_pending_payment_links()
+            if isinstance(result, dict) and result.get("verified_paid"):
+                st.success("Payment verified successfully!")
+                st.session_state.payment_link_url = None
+                st.rerun()
+            else:
+                st.info("The payment is not marked as successful by Razorpay yet. Please complete it and try again in a few seconds.")
 
 
 # ============================================================
@@ -3779,9 +3447,11 @@ def show_subscription_page():
 # ============================================================
 
 def show_main_app():
-    # Authentication is synchronized once during application startup before
-    # this function is called. Avoid a second Supabase round-trip here so page
-    # navigation and ordinary widget reruns remain responsive.
+    # Every Streamlit interaction starts a new script run and recreates the
+    # Supabase client. Reattach the logged-in JWT before any RLS-protected page
+    # performs database work.
+    sync_supabase_auth_from_cookie()
+
     profile = st.session_state.get("profile") or {}
 
     company_name = (
@@ -3805,7 +3475,6 @@ def show_main_app():
             "Master Products",
             "SKU Mappings",
             "Inventory",
-            "Sales Reports",
             "Subscription",
         ]
 
@@ -3848,7 +3517,6 @@ def show_main_app():
         "Master Products",
         "SKU Mappings",
         "Inventory",
-        "Sales Reports",
     }
 
     if page in restricted_pages and not subscription["access"]:
@@ -3872,8 +3540,6 @@ def show_main_app():
         show_sku_mappings()
     elif page == "Inventory":
         show_inventory()
-    elif page == "Sales Reports":
-        show_sales_reports()
     elif page == "Subscription":
         show_subscription_page()
 
