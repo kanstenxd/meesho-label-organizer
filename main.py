@@ -1401,12 +1401,23 @@ def extract_product_section(page_text):
 
 
 def parse_product_details(page_text):
-    """Extract the explicitly labelled SKU, Size, Qty and Color fields.
+    """Extract the SKU, Size, Qty and Color from a Meesho Product Details table.
 
-    Meesho labels can contain a long Order No./product description elsewhere on
-    the page. That text is *not* the SKU. When a Product Details block contains
-    labelled fields, the value immediately associated with ``SKU`` is used as
-    the SKU, while Size, Qty and Color are extracted independently.
+    Meesho labels visually show five columns:
+        SKU | Size | Qty | Color | Order No.
+
+    PyMuPDF usually extracts those columns vertically rather than as one table
+    row. The SKU can also wrap across several lines. Therefore this parser reads
+    the Product Details block structurally from the bottom upward:
+
+        <SKU lines...>
+        <Size>
+        <Qty>
+        <Color>
+        <Order No.>
+
+    Only the text in the SKU column is returned as ``sku``. Size, quantity and
+    color are removed from it and stored in their own fields.
     """
     section = extract_product_section(page_text)
 
@@ -1421,116 +1432,101 @@ def parse_product_details(page_text):
     if not section:
         return result
 
-    # Preserve line boundaries because the PDF often renders fields as:
-    # Product Details / SKU / <exact SKU> / Size / <size> / Qty / <qty> / Color / <color>
-    raw_lines = [
+    lines = [
         re.sub(r"\s+", " ", line).strip()
         for line in section.splitlines()
         if re.sub(r"\s+", " ", line).strip()
     ]
 
-    field_names = {"sku", "size", "qty", "quantity", "color", "colour"}
+    header_labels = {
+        "sku", "size", "qty", "quantity", "color", "colour",
+        "order no.", "order no", "order number",
+    }
 
-    def value_after_label(labels):
-        labels = tuple(label.lower() for label in labels)
+    while lines and lines[0].lower().strip().rstrip(":") in header_labels:
+        lines.pop(0)
 
-        for index, line in enumerate(raw_lines):
-            compact = line.strip()
-            lower = compact.lower().rstrip(":-").strip()
+    if lines and re.search(
+        r"\bSKU\b.*\bSize\b.*\b(?:Qty|Quantity)\b.*\b(?:Color|Colour)\b",
+        lines[0], flags=re.I,
+    ):
+        lines.pop(0)
 
-            # Label and value on the same line, e.g. SKU: Royal Ring GFR 002
-            for label in labels:
-                inline = re.match(
-                    rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
-                    compact,
-                    flags=re.I,
-                )
-                if inline:
-                    value = inline.group(1).strip()
-                    if value:
-                        return value
+    known_colors = [
+        "Multicolor", "Multi Color", "Rose Gold", "Light Blue", "Dark Blue",
+        "Sky Blue", "Navy Blue", "Bottle Green", "Sea Green", "Off White",
+        "Black", "White", "Red", "Blue", "Green", "Yellow", "Orange",
+        "Pink", "Purple", "Brown", "Grey", "Gray", "Gold", "Silver",
+        "Maroon", "Beige", "Cream",
+    ]
+    color_lookup = {color.lower(): color for color in known_colors}
 
-            # Label on its own line; use the next non-label line exactly as shown.
-            if lower in labels:
-                for next_index in range(index + 1, len(raw_lines)):
-                    candidate = raw_lines[next_index]
-                    candidate_lower = candidate.lower().rstrip(":-").strip()
-                    if candidate_lower in field_names:
-                        continue
-                    return candidate
+    size_pattern = (
+        r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
+        r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
+    )
 
-        # Fallback for text extraction that places all fields on one line.
-        flat = "\n".join(raw_lines)
-        for label in labels:
-            match = re.search(
-                rf"\b{re.escape(label)}\b\s*[:\-]?\s*(.+?)(?=\n\s*(?:SKU|Size|Qty|Quantity|Color|Colour)\b|$)",
-                flat,
-                flags=re.I | re.S,
-            )
-            if match:
-                value = re.sub(r"\s+", " ", match.group(1)).strip()
-                if value:
-                    return value
-        return ""
+    # Remove Order No. from the right side of the table.
+    if lines:
+        compact_last = lines[-1].replace(" ", "")
+        if re.fullmatch(r"\d{10,}(?:[_-]\d+)?", compact_last):
+            lines.pop()
+        else:
+            lines[-1] = re.sub(
+                r"\s+\d{10,}(?:[_-]\d+)?\s*$", "", lines[-1]
+            ).strip()
+            if not lines[-1]:
+                lines.pop()
 
-    # Priority: explicitly labelled values. SKU is intentionally not derived
-    # from Order No. or the long product description.
-    result["sku"] = value_after_label(("SKU",))
-    result["size"] = value_after_label(("Size",))
-    qty_value = value_after_label(("Qty", "Quantity"))
-    result["color"] = value_after_label(("Color", "Colour"))
+    # Read Color, Qty and Size from the remaining rightmost values.
+    if lines and lines[-1].lower() in color_lookup:
+        result["color"] = lines.pop()
 
-    if qty_value:
-        qty_match = re.search(r"\d+", qty_value)
-        if qty_match:
-            result["qty"] = max(1, int(qty_match.group(0)))
+    if lines and re.fullmatch(r"\d{1,4}", lines[-1]):
+        result["qty"] = max(1, int(lines.pop()))
 
-    # If a particular PDF layout does not expose separate labels, retain the
-    # older right-to-left table parsing only as a fallback.
+    if lines and re.fullmatch(size_pattern, lines[-1], flags=re.I):
+        result["size"] = re.sub(r"\s+", " ", lines.pop()).strip()
+
+    # Everything left is exactly the SKU column, including any wrapped lines.
+    if lines:
+        result["sku"] = " ".join(lines).strip()
+
+    # Fallback for PDF layouts that flatten the whole table onto one line.
     if not result["sku"]:
-        text = re.sub(r"SKU\s+Size\s+Qty\s+Color", "", section, flags=re.I)
-        working = re.sub(r"\s+", " ", text).strip()
+        flat = re.sub(
+            r"SKU\s+Size\s+(?:Qty|Quantity)\s+(?:Color|Colour)"
+            r"(?:\s+Order\s*No\.?)?",
+            "", section, flags=re.I,
+        )
+        flat = re.sub(r"\s+", " ", flat).strip()
+        flat = re.sub(r"\s+\d{10,}(?:[_-]\d+)?\s*$", "", flat).strip()
 
-        known_colors = [
-            "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
-            "Dark Blue", "Sky Blue", "Navy Blue", "Bottle Green",
-            "Sea Green", "Off White", "Black", "White", "Red", "Blue",
-            "Green", "Yellow", "Orange", "Pink", "Purple", "Brown",
-            "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
-        ]
         color_pattern = "|".join(
-            re.escape(color)
-            for color in sorted(known_colors, key=len, reverse=True)
+            re.escape(color) for color in sorted(known_colors, key=len, reverse=True)
         )
-
-        color_match = re.search(
-            rf"\b({color_pattern})\s*$", working, flags=re.I
-        )
+        color_match = re.search(rf"\s+({color_pattern})\s*$", flat, flags=re.I)
         if color_match:
-            if not result["color"]:
-                result["color"] = re.sub(r"\s+", " ", color_match.group(1)).strip()
-            working = working[:color_match.start()].strip()
+            result["color"] = result["color"] or re.sub(
+                r"\s+", " ", color_match.group(1)
+            ).strip()
+            flat = flat[:color_match.start()].rstrip()
 
-        qty_match = re.search(r"\b(\d{1,4})\s*$", working)
+        qty_match = re.search(r"\s+(\d{1,4})\s*$", flat)
         if qty_match:
-            if not qty_value:
-                result["qty"] = max(1, int(qty_match.group(1)))
-            working = working[:qty_match.start()].strip()
+            result["qty"] = max(1, int(qty_match.group(1)))
+            flat = flat[:qty_match.start()].rstrip()
 
-        size_pattern = (
-            r"Free\s+Size|One\s+Size|XXS|XS|S|M|L|XL|XXL|XXXL|"
-            r"Small|Medium|Large|\d{1,3}(?:\.\d+)?\s*(?:cm|inch|in)?"
-        )
-        size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
+        size_match = re.search(rf"\s+({size_pattern})\s*$", flat, flags=re.I)
         if size_match:
-            if not result["size"]:
-                result["size"] = re.sub(r"\s+", " ", size_match.group(1)).strip()
-            working = working[:size_match.start()].strip()
+            result["size"] = result["size"] or re.sub(
+                r"\s+", " ", size_match.group(1)
+            ).strip()
+            flat = flat[:size_match.start()].rstrip()
 
-        result["sku"] = re.sub(r"\s+", " ", working).strip()
+        result["sku"] = flat.strip()
 
     return result
-
 
 # ============================================================
 # AUTOMATIC MASTER PRODUCT MATCHING
