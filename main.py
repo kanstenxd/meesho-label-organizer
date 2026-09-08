@@ -1438,95 +1438,168 @@ def extract_product_section(page_text):
 
 
 def parse_product_details(page_text):
-    """Extract the explicitly labelled SKU, Size, Qty and Color fields.
+    """Extract SKU, Size, Qty and Color from a Meesho label page safely.
 
-    Meesho labels can contain a long Order No./product description elsewhere on
-    the page. That text is *not* the SKU. When a Product Details block contains
-    labelled fields, the value immediately associated with ``SKU`` is used as
-    the SKU, while Size, Qty and Color are extracted independently.
+    Meesho PDFs do not always preserve their visual table layout when text is
+    extracted. A common failure mode is reading the header ``SKU Size Qty Color
+    Order No.`` as if ``Order No.`` were the SKU value. This parser searches the
+    whole page for real field/value pairs, explicitly rejects table headers and
+    order metadata, and only then falls back to the older table-style parser.
     """
-    section = extract_product_section(page_text)
-
     result = {
         "sku": "",
         "size": "",
         "qty": 1,
         "color": "",
-        "raw_product_details": section,
+        "raw_product_details": extract_product_section(page_text),
     }
 
-    if not section:
+    if not page_text:
         return result
 
-    # Preserve line boundaries because the PDF often renders fields as:
-    # Product Details / SKU / <exact SKU> / Size / <size> / Qty / <qty> / Color / <color>
     raw_lines = [
         re.sub(r"\s+", " ", line).strip()
-        for line in section.splitlines()
+        for line in page_text.splitlines()
         if re.sub(r"\s+", " ", line).strip()
     ]
 
-    field_names = {"sku", "size", "qty", "quantity", "color", "colour"}
+    field_labels = {
+        "sku", "size", "qty", "quantity", "color", "colour",
+        "order no", "order no.", "order number", "product details",
+    }
+    invalid_sku_values = {
+        "sku", "size", "qty", "quantity", "color", "colour",
+        "order no", "order no.", "order number", "product details",
+        "order details", "tax invoice", "invoice", "page",
+    }
 
-    def value_after_label(labels):
-        labels = tuple(label.lower() for label in labels)
+    def clean_value(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" :-\t")
+        return value
+
+    def is_label_or_metadata(value, for_sku=False):
+        value = clean_value(value)
+        normalized = value.lower().rstrip(".:").strip()
+        if not value:
+            return True
+        if normalized in {x.rstrip(".:") for x in field_labels}:
+            return True
+        if for_sku and normalized in {x.rstrip(".:") for x in invalid_sku_values}:
+            return True
+        if re.fullmatch(r"(?:order\s*)?(?:no|number)\.?", normalized, flags=re.I):
+            return True
+        # A value that is itself only a column heading is never a product SKU.
+        if for_sku and re.fullmatch(r"(?:sku|size|qty|quantity|colou?r|order\s*(?:no\.?|number))", normalized, flags=re.I):
+            return True
+        return False
+
+    def line_values_after_label(labels, for_sku=False):
+        """Return every plausible value following a label occurrence."""
+        found = []
+        normalized_labels = [label.lower() for label in labels]
 
         for index, line in enumerate(raw_lines):
-            compact = line.strip()
+            compact = clean_value(line)
             lower = compact.lower().rstrip(":-").strip()
 
-            # Label and value on the same line, e.g. SKU: Royal Ring GFR 002
-            for label in labels:
-                inline = re.match(
+            # Same-line form: SKU: ABC-123
+            for label in normalized_labels:
+                match = re.match(
                     rf"^{re.escape(label)}\s*[:\-]\s*(.+)$",
                     compact,
                     flags=re.I,
                 )
-                if inline:
-                    value = inline.group(1).strip()
-                    if value:
-                        return value
+                if match:
+                    value = clean_value(match.group(1))
+                    if not is_label_or_metadata(value, for_sku):
+                        found.append(value)
 
-            # Label on its own line; use the next non-label line exactly as shown.
-            if lower in labels:
+            # Label on its own line. Keep looking past consecutive column
+            # headers, but never accept Order No. as a product value.
+            if lower in normalized_labels:
                 for next_index in range(index + 1, len(raw_lines)):
-                    candidate = raw_lines[next_index]
+                    candidate = clean_value(raw_lines[next_index])
                     candidate_lower = candidate.lower().rstrip(":-").strip()
-                    if candidate_lower in field_names:
+                    if candidate_lower in {x.rstrip(".:") for x in field_labels}:
                         continue
-                    return candidate
+                    if is_label_or_metadata(candidate, for_sku):
+                        continue
+                    found.append(candidate)
+                    break
 
-        # Fallback for text extraction that places all fields on one line.
-        flat = "\n".join(raw_lines)
-        for label in labels:
-            match = re.search(
-                rf"\b{re.escape(label)}\b\s*[:\-]?\s*(.+?)(?=\n\s*(?:SKU|Size|Qty|Quantity|Color|Colour)\b|$)",
-                flat,
-                flags=re.I | re.S,
-            )
-            if match:
-                value = re.sub(r"\s+", " ", match.group(1)).strip()
-                if value:
-                    return value
-        return ""
+        return found
 
-    # Priority: explicitly labelled values. SKU is intentionally not derived
-    # from Order No. or the long product description.
-    result["sku"] = value_after_label(("SKU",))
-    result["size"] = value_after_label(("Size",))
-    qty_value = value_after_label(("Qty", "Quantity"))
-    result["color"] = value_after_label(("Color", "Colour"))
+    def choose_best(values, for_sku=False):
+        cleaned = []
+        seen = set()
+        for value in values:
+            value = clean_value(value)
+            key = value.lower()
+            if not value or key in seen or is_label_or_metadata(value, for_sku):
+                continue
+            seen.add(key)
+            cleaned.append(value)
 
-    if qty_value:
-        qty_match = re.search(r"\d+", qty_value)
+        if not cleaned:
+            return ""
+
+        # Product SKUs are normally more descriptive than a one-word field
+        # value. Prefer values containing letters and multiple characters.
+        if for_sku:
+            product_like = [
+                value for value in cleaned
+                if re.search(r"[A-Za-z]", value)
+                and not re.fullmatch(r"\d+", value)
+            ]
+            if product_like:
+                return max(product_like, key=len)
+        return cleaned[0]
+
+    result["sku"] = choose_best(
+        line_values_after_label(("SKU",), for_sku=True),
+        for_sku=True,
+    )
+    result["size"] = choose_best(
+        line_values_after_label(("Size",)),
+    )
+    qty_values = line_values_after_label(("Qty", "Quantity"))
+    result["color"] = choose_best(
+        line_values_after_label(("Color", "Colour")),
+    )
+
+    for value in qty_values:
+        qty_match = re.search(r"\b(\d+)\b", value)
         if qty_match:
-            result["qty"] = max(1, int(qty_match.group(0)))
+            result["qty"] = max(1, int(qty_match.group(1)))
+            break
 
-    # If a particular PDF layout does not expose separate labels, retain the
-    # older right-to-left table parsing only as a fallback.
+    # Text extraction can flatten the table into one line. Search for a SKU
+    # value bounded by another recognised field. This deliberately includes
+    # Order No. as a boundary so it cannot become the SKU value.
     if not result["sku"]:
-        text = re.sub(r"SKU\s+Size\s+Qty\s+Color", "", section, flags=re.I)
-        working = re.sub(r"\s+", " ", text).strip()
+        flat = "\n".join(raw_lines)
+        sku_matches = re.finditer(
+            r"\bSKU\b\s*[:\-]?\s*(.+?)(?=\n\s*(?:SKU|Size|Qty|Quantity|Color|Colour|Order\s*(?:No\.?|Number))\b|$)",
+            flat,
+            flags=re.I | re.S,
+        )
+        for match in sku_matches:
+            value = clean_value(match.group(1))
+            if not is_label_or_metadata(value, True):
+                result["sku"] = value
+                break
+
+    # Last-resort legacy parser. Use the Product Details block first, then the
+    # whole page, but strip all known headers before interpreting the row.
+    if not result["sku"]:
+        source = result["raw_product_details"] or page_text
+        source = re.sub(
+            r"\b(?:Product\s*Details|SKU|Size|Qty|Quantity|Color|Colour|Order\s*(?:No\.?|Number))\b",
+            " ",
+            source,
+            flags=re.I,
+        )
+        working = re.sub(r"\s+", " ", source).strip()
 
         known_colors = [
             "Multicolor", "Multi Color", "Rose Gold", "Light Blue",
@@ -1536,22 +1609,18 @@ def parse_product_details(page_text):
             "Grey", "Gray", "Gold", "Silver", "Maroon", "Beige", "Cream",
         ]
         color_pattern = "|".join(
-            re.escape(color)
-            for color in sorted(known_colors, key=len, reverse=True)
+            re.escape(color) for color in sorted(known_colors, key=len, reverse=True)
         )
 
-        color_match = re.search(
-            rf"\b({color_pattern})\s*$", working, flags=re.I
-        )
+        color_match = re.search(rf"\b({color_pattern})\s*$", working, flags=re.I)
         if color_match:
             if not result["color"]:
-                result["color"] = re.sub(r"\s+", " ", color_match.group(1)).strip()
+                result["color"] = clean_value(color_match.group(1))
             working = working[:color_match.start()].strip()
 
         qty_match = re.search(r"\b(\d{1,4})\s*$", working)
         if qty_match:
-            if not qty_value:
-                result["qty"] = max(1, int(qty_match.group(1)))
+            result["qty"] = max(1, int(qty_match.group(1)))
             working = working[:qty_match.start()].strip()
 
         size_pattern = (
@@ -1561,10 +1630,17 @@ def parse_product_details(page_text):
         size_match = re.search(rf"\b({size_pattern})\s*$", working, flags=re.I)
         if size_match:
             if not result["size"]:
-                result["size"] = re.sub(r"\s+", " ", size_match.group(1)).strip()
+                result["size"] = clean_value(size_match.group(1))
             working = working[:size_match.start()].strip()
 
-        result["sku"] = re.sub(r"\s+", " ", working).strip()
+        candidate = clean_value(working)
+        if not is_label_or_metadata(candidate, True):
+            result["sku"] = candidate
+
+    # Absolute safety net: never allow Order No. or another header to enter the
+    # extracted data table as a SKU.
+    if is_label_or_metadata(result["sku"], True):
+        result["sku"] = ""
 
     return result
 
@@ -1902,31 +1978,20 @@ def reorganize_pdfs(uploaded_files):
                 # assigns the SKU on the review screen or in SKU Mappings.
                 # Existing saved mappings are still reused automatically.
 
-                # Keep one review item per unique extracted SKU.
-                if (
-                    not master_product
-                    and sku_key
-                    and candidates
-                    and sku_key not in review_candidates
-                ):
-                    review_candidates[sku_key] = {
-                        "sku": details["sku"],
-                        "candidates": candidates,
-                        "row_indexes": [
+                # Keep one review item per unique, unassigned SKU. A review
+                # entry must exist even when there are no similarity suggestions;
+                # the user can still select any Master Product or create a new one.
+                if not master_product and sku_key:
+                    if sku_key not in review_candidates:
+                        review_candidates[sku_key] = {
+                            "sku": details["sku"],
+                            "candidates": candidates or [],
+                            "row_indexes": [len(extracted_rows) - 1],
+                        }
+                    else:
+                        review_candidates[sku_key]["row_indexes"].append(
                             len(extracted_rows) - 1
-                        ],
-                    }
-                elif (
-                    not master_product
-                    and sku_key
-                    and candidates
-                    and sku_key in review_candidates
-                ):
-                    review_candidates[sku_key][
-                        "row_indexes"
-                    ].append(
-                        len(extracted_rows) - 1
-                    )
+                        )
 
                 single_page_pdf = fitz.open()
                 single_page_pdf.insert_pdf(
@@ -2764,67 +2829,66 @@ def show_pdf_organizer():
 
     if review_candidates:
         st.divider()
-        st.subheader("🔍 Review Similar SKU Matches")
+        st.subheader("🔍 Review & Assign Master Products")
         st.info(
-            "Every SKU that has not been assigned with the exact same text previously requires "
-            "your confirmation. The app will suggest the best possible Master "
-            "Products, but it will not assign a first-time SKU automatically. "
-            "Once you assign it, the mapping is remembered and the same SKU "
-            "will be assigned automatically in future uploads."
+            "Unassigned SKUs appear here even when no automatic suggestion is "
+            "available. Choose any existing Master Product or create a new one. "
+            "Once assigned, the SKU mapping is remembered for future uploads."
         )
 
-        for review_key, review in list(
-            review_candidates.items()
-        ):
-            sku = review.get("sku", "")
-            candidates = review.get(
-                "candidates",
-                [],
-            )
+        # Load every Master Product once so the dropdown remains available even
+        # when similarity matching returned no candidates.
+        all_master_names = sorted(
+            {
+                get_master_product_name(product)
+                for product in get_inventory()
+                if get_master_product_name(product)
+            },
+            key=lambda value: value.lower(),
+        )
 
-            if not sku or not candidates:
+        for review_key, review in list(review_candidates.items()):
+            sku = str(review.get("sku", "") or "").strip()
+            candidates = review.get("candidates", []) or []
+
+            if not sku:
                 continue
 
-            with st.expander(
-                f"SKU: {sku}",
-                expanded=True,
-            ):
-                best = candidates[0]
-
-                st.write(
-                    f"**Highest possible match:** "
-                    f"{best['name']} ({best['score']:.0%})"
-                )
-
-                st.caption(
-                    "Other possible Master Products are listed below. "
-                    "Choose one to assign this SKU."
-                )
-
-                candidate_options = [
-                    (
-                        f"{candidate['name']} "
-                        f"— {candidate['score']:.0%}"
+            with st.expander(f"SKU: {sku}", expanded=True):
+                suggested_names = []
+                if candidates:
+                    best = candidates[0]
+                    st.write(
+                        f"**Best suggestion:** {best['name']} "
+                        f"({best['score']:.0%})"
                     )
-                    for candidate in candidates
-                ]
+                    suggested_names = [
+                        candidate.get("name", "").strip()
+                        for candidate in candidates
+                        if candidate.get("name")
+                    ]
+                else:
+                    st.warning(
+                        "No similarity suggestion was found for this SKU. "
+                        "You can still choose any existing Master Product below."
+                    )
 
-                selected_label = st.selectbox(
-                    "Possible Master Product",
-                    candidate_options,
-                    key=f"review_master_{review_key}",
-                )
+                # Suggestions first, followed by every remaining Master Product.
+                options = []
+                seen = set()
+                for name in suggested_names + all_master_names:
+                    key = normalize_text(name)
+                    if name and key not in seen:
+                        seen.add(key)
+                        options.append(name)
 
-                selected_index = candidate_options.index(
-                    selected_label
-                )
-                selected_master = candidates[
-                    selected_index
-                ]["name"]
+                if options:
+                    selected_master = st.selectbox(
+                        "Assign an existing Master Product",
+                        options,
+                        key=f"review_master_{review_key}",
+                    )
 
-                col1, col2 = st.columns(2)
-
-                with col1:
                     if st.button(
                         "Assign Selected Master Product",
                         key=f"assign_review_{review_key}",
@@ -2834,73 +2898,55 @@ def show_pdf_organizer():
                             results,
                             sku,
                             selected_master,
-                            "User-approved similar match",
+                            "User-approved Master Product assignment",
                         ):
                             st.success(
-                                f"'{sku}' was assigned to "
-                                f"'{selected_master}'."
+                                f"'{sku}' was assigned to '{selected_master}'."
                             )
                             st.session_state.batch_results = results
                             st.rerun()
-
-                with col2:
-                    new_master_name = st.text_input(
-                        "Or create a new Master Product",
-                        placeholder="Enter new Master Product name",
-                        key=f"new_master_{review_key}",
+                else:
+                    st.info(
+                        "No Master Products exist yet. Create one below to continue."
                     )
 
-                    if st.button(
-                        "Create & Assign",
-                        key=f"create_assign_{review_key}",
-                    ):
-                        new_master_name = (
-                            new_master_name.strip()
-                        )
+                new_master_name = st.text_input(
+                    "Or create a new Master Product",
+                    placeholder="Enter new Master Product name",
+                    key=f"new_master_{review_key}",
+                )
 
-                        if not new_master_name:
-                            st.warning(
-                                "Enter a new Master Product name first."
+                if st.button(
+                    "Create & Assign",
+                    key=f"create_assign_{review_key}",
+                ):
+                    new_master_name = new_master_name.strip()
+                    if not new_master_name:
+                        st.warning("Enter a new Master Product name first.")
+                    else:
+                        existing_names = {
+                            normalize_text(get_master_product_name(product))
+                            for product in get_inventory()
+                            if get_master_product_name(product)
+                        }
+
+                        if normalize_text(new_master_name) not in existing_names:
+                            if not add_master_product(new_master_name, 0, 0):
+                                st.error("Could not create the new Master Product.")
+                                continue
+
+                        if apply_review_assignment(
+                            results,
+                            sku,
+                            new_master_name,
+                            "New Master Product created and assigned",
+                        ):
+                            st.success(
+                                f"Created/used '{new_master_name}' and assigned "
+                                f"'{sku}'."
                             )
-                        else:
-                            existing_names = {
-                                normalize_text(
-                                    get_master_product_name(
-                                        product
-                                    )
-                                )
-                                for product in get_inventory()
-                            }
-
-                            if normalize_text(
-                                new_master_name
-                            ) not in existing_names:
-                                if not add_master_product(
-                                    new_master_name,
-                                    0,
-                                    0,
-                                ):
-                                    st.error(
-                                        "Could not create the new "
-                                        "Master Product."
-                                    )
-                                    continue
-
-                            if apply_review_assignment(
-                                results,
-                                sku,
-                                new_master_name,
-                                (
-                                    "New Master Product created "
-                                    "and assigned"
-                                ),
-                            ):
-                                st.success(
-                                    f"Created/used '{new_master_name}' "
-                                    f"and assigned '{sku}'."
-                                )
-                                st.session_state.batch_results = results
-                                st.rerun()
+                            st.session_state.batch_results = results
+                            st.rerun()
 
     remembered_assignments = results.get(
         "remembered_assignments",
