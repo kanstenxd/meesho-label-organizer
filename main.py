@@ -2661,7 +2661,29 @@ def show_sku_mappings():
 # ============================================================
 
 def show_pdf_organizer():
-    st.title("📄 PDF Label Organizer")
+    # Keep the heading and Clear Data action on the same top row.
+    # The uploader key is versioned so clearing also resets the selected PDFs
+    # without requiring a manual browser refresh.
+    if "pdf_uploader_version" not in st.session_state:
+        st.session_state.pdf_uploader_version = 0
+
+    title_col, clear_col = st.columns([8, 2], vertical_alignment="center")
+
+    with title_col:
+        st.title("📄 PDF Label Organizer")
+
+    with clear_col:
+        if st.button(
+            "🗑️ Clear Data",
+            key="clear_pdf_organizer_data",
+            use_container_width=True,
+        ):
+            # Clear only the current PDF Organizer work. Nothing stored in
+            # Master Products, SKU Mappings, Inventory, Sales, or the database
+            # is deleted.
+            st.session_state.batch_results = None
+            st.session_state.pdf_uploader_version += 1
+            st.rerun()
 
     st.caption(
         "Every page is processed individually. SKU, Size, Qty and Color "
@@ -2705,6 +2727,7 @@ def show_pdf_organizer():
         "Upload Meesho Label PDFs",
         type=["pdf"],
         accept_multiple_files=True,
+        key=f"pdf_label_upload_{st.session_state.pdf_uploader_version}",
     )
 
     if uploaded_files and st.button(
