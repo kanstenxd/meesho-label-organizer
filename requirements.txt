@@ -3,3 +3,4 @@ supabase
 PyMuPDF
 pandas
 extra-streamlit-components
+razorpay
