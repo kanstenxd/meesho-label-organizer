@@ -20,8 +20,12 @@ st.set_page_config(
 
 MONTHLY_PRICE = 399
 LIFETIME_PRICE = 7777
-LIFETIME_COUPON_DISCOUNT_PERCENT = 10
-LIFETIME_COUPON_CODE = str(st.secrets.get("LIFETIME_COUPON_CODE", "LIFETIME10")).strip()
+
+# Lifetime special coupon.
+# SIVOM100 gives 100% discount and activates lifetime access without
+# creating a ₹0 Razorpay payment link.
+LIFETIME_COUPON_CODE = "SIVOM100"
+LIFETIME_COUPON_DISCOUNT_PERCENT = 100
 DEMO_HOURS = 12
 DEMO_PDF_LIMIT = 2
 ADMIN_EMAILS = {"keyurtank8@gmail.com"}
@@ -3162,6 +3166,60 @@ def update_payment_record(reference_id, updates):
         return False
 
 
+def activate_free_lifetime_coupon():
+    """Activate lifetime access for the valid 100% discount coupon.
+
+    Razorpay Payment Links cannot be used for a ₹0 purchase, so the application
+    records this explicitly as a successful free lifetime redemption instead.
+    """
+    user_id = get_current_user_id()
+    company_id = get_company_id()
+
+    if not user_id:
+        st.error("Please log in before redeeming the coupon.")
+        return False
+
+    # Prevent duplicate free-redemption rows if the user clicks the button twice.
+    try:
+        existing = (
+            supabase.table("payments")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("plan", "lifetime")
+            .in_("status", ["paid", "completed", "success"])
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            st.success("Your lifetime access is already active.")
+            return True
+    except Exception:
+        pass
+
+    reference_id = _payment_reference("lifetime-coupon")
+
+    payload = {
+        "user_id": user_id,
+        "company_id": company_id,
+        "plan": "lifetime",
+        "amount": 0,
+        "status": "paid",
+        "razorpay_reference_id": reference_id,
+        "paid_at": now_utc().isoformat(),
+    }
+
+    try:
+        supabase.table("payments").insert(payload).execute()
+        st.session_state.payment_link_url = None
+        st.session_state.payment_link_plan = None
+        st.success("🎉 SIVOM100 applied successfully! Your lifetime access is now active.")
+        return True
+    except Exception as e:
+        st.error(f"Could not activate lifetime access: {e}")
+        return False
+
+
 def create_razorpay_payment_link(plan, amount, description):
     """Create a Razorpay-hosted payment page for the logged-in user."""
     client = get_razorpay_client()
@@ -3405,20 +3463,53 @@ def show_subscription_page():
 
         lifetime_amount = LIFETIME_PRICE
         coupon_applied = False
-        if coupon and coupon.upper() == LIFETIME_COUPON_CODE.upper():
-            discount = round(LIFETIME_PRICE * LIFETIME_COUPON_DISCOUNT_PERCENT / 100)
-            lifetime_amount = LIFETIME_PRICE - discount
+        coupon_is_free = False
+
+        # Coupon matching is exact and case-sensitive.
+        if coupon and coupon == LIFETIME_COUPON_CODE:
+            discount = round(
+                LIFETIME_PRICE
+                * LIFETIME_COUPON_DISCOUNT_PERCENT
+                / 100
+            )
+            lifetime_amount = max(0, LIFETIME_PRICE - discount)
             coupon_applied = True
-            st.success(f"Coupon applied! {LIFETIME_COUPON_DISCOUNT_PERCENT}% off — pay ₹{lifetime_amount}.")
+            coupon_is_free = lifetime_amount == 0
+
+            if coupon_is_free:
+                st.success(
+                    "🎉 Coupon applied! SIVOM100 gives you 100% off — "
+                    "Lifetime Access is FREE."
+                )
+            else:
+                st.success(
+                    f"Coupon applied! {LIFETIME_COUPON_DISCOUNT_PERCENT}% off "
+                    f"— pay ₹{lifetime_amount}."
+                )
         elif coupon:
             st.error("Invalid lifetime coupon code.")
 
-        if st.button("Buy Lifetime Access", use_container_width=True, type="primary", key="lifetime_razorpay"):
-            create_razorpay_payment_link(
-                "lifetime",
-                lifetime_amount,
-                "Meesho Label Organizer - Lifetime Access",
-            )
+        if coupon_is_free:
+            if st.button(
+                "Activate Free Lifetime Access",
+                use_container_width=True,
+                type="primary",
+                key="lifetime_free_coupon",
+            ):
+                if activate_free_lifetime_coupon():
+                    st.rerun()
+        else:
+            if st.button(
+                "Buy Lifetime Access",
+                use_container_width=True,
+                type="primary",
+                key="lifetime_razorpay",
+            ):
+                create_razorpay_payment_link(
+                    "lifetime",
+                    lifetime_amount,
+                    "Meesho Label Organizer - Lifetime Access",
+                )
 
     payment_url = st.session_state.get("payment_link_url")
     if payment_url:
